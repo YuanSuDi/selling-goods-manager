@@ -213,6 +213,13 @@ function startManagerServer() {
     })
     if (!product) return { ok: true, matched: false, itemId }
 
+    // 同じ出品は一度しか売れないため、処理済みの商品 ID の売却報告は
+    // 二度目以降を在庫に反映しない（発送までやることリストに残り続け、
+    // スキャンが繰り返し報告しても二重に引かないようにする）。
+    if (product.last_processed_sale_item_id === itemId) {
+      return { ok: true, matched: true, duplicate: true, itemId, product_no: product.product_no }
+    }
+
     const newSku = Math.max(0, Number(product.sku || 0) - 1)
     const newSoldNum = Number(product.selled_num || 0) + 1
     const updatedCount = await new Promise((resolve, reject) => {
@@ -220,12 +227,14 @@ function startManagerServer() {
         {
           product_no: product.product_no,
           mercari_ref: product.mercari_ref,
+          last_processed_sale_item_id: { $ne: itemId },
         },
         {
           $set: {
             sku: newSku,
             selled_num: newSoldNum,
             list_error: null,
+            last_processed_sale_item_id: itemId,
           },
         },
         {},
