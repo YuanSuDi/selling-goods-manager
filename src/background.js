@@ -452,6 +452,19 @@ async function createWindow() {
     openFolder(folderPath);
   })
 
+  ipcMain.on('open_user_data_folder', async () => {
+    try {
+      const error = await shell.openPath(userDataDir)
+      if (error) throw new Error(error)
+    } catch (error) {
+      console.error('[storage] failed to open user data folder', error)
+      dialog.showErrorBox(
+        '无法打开用户数据文件夹',
+        error && error.message ? error.message : String(error)
+      )
+    }
+  })
+
   ipcMain.on('select_main_image', async (e) => {
     const result = await dialog.showOpenDialog(window, {
       title: 'メイン商品画像を選択',

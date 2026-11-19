@@ -1,7 +1,7 @@
 <script setup>
   // 画面シェル（旧単一ファイルから分割）。状態と IPC は ../store.js に集約し、
   // 一覧・追加フォーム・各モーダルは個別コンポーネントに分かれている。
-  import { PlusOutlined, UnorderedListOutlined, ShopOutlined, LinkOutlined } from '@ant-design/icons-vue';
+  import { PlusOutlined, UnorderedListOutlined, ShopOutlined, LinkOutlined, FolderOpenOutlined } from '@ant-design/icons-vue';
   import {
     activeKey, alertDisFlg, alertMsg, alertDisFlgHandleClose,
     successFlg, successMsg, activeTaskCount, openTaskModal, showManagerInfo,
@@ -14,6 +14,8 @@
   import MercariBindingModal from './MercariBindingModal.vue';
   import ManagerInfoModal from './ManagerInfoModal.vue';
   import TaskManagerModal from './TaskManagerModal.vue';
+
+  const openUserDataFolder = () => window.ipcRenderer.send('open_user_data_folder');
 </script>
 
 <template>
@@ -36,6 +38,10 @@
         <a-button @click="showManagerInfo">
           <template #icon><LinkOutlined /></template>
           連携情報
+        </a-button>
+        <a-button @click="openUserDataFolder">
+          <template #icon><FolderOpenOutlined /></template>
+          用户数据位置
         </a-button>
       </div>
     </header>
