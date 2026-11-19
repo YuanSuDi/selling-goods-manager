@@ -285,9 +285,11 @@ let window
 async function createWindow() {
 
   // Create the browser window.
+  const windowTitle = `商品管理程序 v${app.getVersion()}`
   window = new BrowserWindow({
     width: 1380,
     height: 1000,
+    title: windowTitle,
     webPreferences: {
       nodeIntegration:true,
       contextIsolation: false,
@@ -296,6 +298,10 @@ async function createWindow() {
     },
     icon:path.join(__static, "app.ico"),
     autoHideMenuBar: true
+  })
+  window.on('page-title-updated', (event) => {
+    event.preventDefault()
+    window.setTitle(windowTitle)
   })
 
   // 右クリックメニュー。Electron はブラウザと違い標準でコンテキスト
