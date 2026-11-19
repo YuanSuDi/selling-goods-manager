@@ -1,0 +1,96 @@
+{
+  "browserslist": [
+    "> 1%",
+    "last 2 versions",
+    "not dead",
+    "not ie 11"
+  ],
+  "build": {
+    "appId": "selling-goods-manager",
+    "asar": false,
+    "directories": {
+      "app": "dist_electron/bundled",
+      "output": "dist_electron"
+    },
+    "files": [
+      "**"
+    ],
+    "extraFiles": [
+      {
+        "from": "app/.local-chromium",
+        "to": "app/.local-chromium"
+      }
+    ],
+    "nsis": {
+      "allowToChangeInstallationDirectory": true,
+      "installerHeaderIcon": "./app.ico",
+      "installerIcon": "./app.ico",
+      "oneClick": false
+    },
+    "productName": "selling-goods-manager product by Yuan",
+    "win": {
+      "icon": "./app.ico",
+      "target": [
+        {
+          "target": "nsis"
+        }
+      ]
+    }
+  },
+  "devDependencies": {
+    "@ant-design/icons-vue": "^7.0.1",
+    "@babel/core": "^7.12.16",
+    "@babel/eslint-parser": "^7.12.16",
+    "@vue/cli-plugin-babel": "~5.0.0",
+    "@vue/cli-plugin-eslint": "~5.0.0",
+    "@vue/cli-service": "~5.0.0",
+    "ant-design-vue": "4.x",
+    "axios": "^1.6.8",
+    "cheerio": "=1.0.0-rc.3",
+    "core-js": "^3.8.3",
+    "electron": "^39.0.0",
+    "electron-builder": "^26.0.0",
+    "electron-devtools-installer": "^3.1.0",
+    "element-plus": "^2.6.3",
+    "eslint": "^7.32.0",
+    "eslint-plugin-vue": "^8.0.3",
+    "jest": "^22.1.4",
+    "less": "^4.2.0",
+    "less-loader": "^12.2.0",
+    "lowdb": "^6.0.1",
+    "nedb": "^1.8.0",
+    "parse5-htmlparser2-tree-adapter": "^6.0.0",
+    "puppeteer": "^18.1.0",
+    "unplugin-vue-components": "^0.26.0",
+    "vue": "^3.2.13",
+    "vue-devtools": "^5.1.4",
+    "vue-request": "^2.0.4",
+    "webpack": "^5.0.0",
+    "webpack-cli": "^5.0.0",
+    "yarn": "^1.22.22"
+  },
+  "eslintConfig": {
+    "env": {
+      "node": true
+    },
+    "extends": [
+      "plugin:vue/vue3-essential"
+    ],
+    "parserOptions": {
+      "parser": "@babel/eslint-parser"
+    },
+    "root": true,
+    "rules": {}
+  },
+  "main": "background.js",
+  "name": "selling-goods-manager",
+  "private": true,
+  "scripts": {
+    "build": "vue-cli-service build",
+    "electron:build": "vue-cli-service build --dest dist_electron/bundled && webpack --config webpack.main.config.js && node scripts/write-app-package.js && electron-builder",
+    "electron:serve": "node scripts/dev.js",
+    "lint": "vue-cli-service lint",
+    "serve": "vue-cli-service serve"
+  },
+  "version": "0.1.0"
+}
