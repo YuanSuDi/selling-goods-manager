@@ -34,7 +34,51 @@ jobs:
           New-Item -ItemType Directory -Force "app/.local-chromium" | Out-Null
           Copy-Item -Recurse -Force $source "app/.local-chromium/"
 
-      - name: Build and publish
-        run: yarn electron:build --publish always
+      - name: Build Windows installer
+        run: yarn electron:build --publish never
+
+      - name: Publish release assets
+        shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $publishDir = Join-Path $env:RUNNER_TEMP "release-assets"
+          New-Item -ItemType Directory -Force $publishDir | Out-Null
+
+          $installer = Get-ChildItem "dist_electron" -Filter "*Setup $version.exe" | Select-Object -First 1
+          if (-not $installer) {
+            throw "Windows installer for version $version was not produced"
+          }
+          $blockmap = Get-Item "$($installer.FullName).blockmap" -ErrorAction Stop
+          $installerName = "selling-goods-manager-product-by-Yuan-Setup-$version.exe"
+          Copy-Item $installer.FullName (Join-Path $publishDir $installerName)
+          Copy-Item $blockmap.FullName (Join-Path $publishDir "$($installerName).blockmap")
+          Copy-Item "dist_electron/latest.yml" (Join-Path $publishDir "latest.yml")
+
+          gh release view $tag --repo $env:GITHUB_REPOSITORY 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --title $tag --notes "Windows installer release $tag." --verify-tag --repo $env:GITHUB_REPOSITORY
+            if ($LASTEXITCODE -ne 0) {
+              throw "Could not create GitHub Release $tag"
+            }
+          }
+          gh release upload $tag `
+            (Join-Path $publishDir $installerName) `
+            (Join-Path $publishDir "$($installerName).blockmap") `
+            (Join-Path $publishDir "latest.yml") `
+            --clobber `
+            --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not upload all assets to GitHub Release $tag"
+          }
+          $uploadedAssets = gh release view $tag --repo $env:GITHUB_REPOSITORY --json assets --jq '.assets[].name'
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not verify assets for GitHub Release $tag"
+          }
+          foreach ($asset in @($installerName, "$($installerName).blockmap", "latest.yml")) {
+            if ($uploadedAssets -notcontains $asset) {
+              throw "GitHub Release $tag is missing asset $asset"
+            }
+          }
