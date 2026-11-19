@@ -206,7 +206,7 @@ function createManagerServer(options) {
         const itemId = body.itemId
           ? String(body.itemId).trim()
           : platform === "yahoo"
-            ? String(body.listingUrl || "").match(/\/jp\/auction\/([a-zA-Z][0-9]+)/)?.[1] || null
+            ? String(body.listingUrl || "").match(/\/jp\/auction\/([a-zA-Z]?[0-9]+)/)?.[1] || null
             : String(body.listingUrl || "").match(/\/item\/(m[A-Za-z0-9]+)/)?.[1] || null;
         if (!itemId) {
           return sendJson(res, 400, { ok: false, error: "itemId or listingUrl is required" });

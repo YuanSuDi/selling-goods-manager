@@ -81,13 +81,14 @@ function normalizeMercariUrl(input) {
 }
 
 // Yahoo!オークションの参照商品 URL を正規化する。完全な URL でも、
-// 英字1文字+数字のオークション ID だけでも受け付ける。解釈できなければ null。
+// オークション ID（英字0〜1文字+数字。古い商品は数字のみ）だけでも
+// 受け付ける。解釈できなければ null。
 function normalizeYahooUrl(input) {
   if (!input) return null
   const s = String(input).trim()
   const m =
-    s.match(/auctions\.yahoo\.co\.jp\/jp\/auction\/([a-z]\d+)/) ||
-    s.match(/^([a-z]\d+)$/)
+    s.match(/auctions\.yahoo\.co\.jp\/jp\/auction\/([a-z]?\d+)/) ||
+    s.match(/^([a-z]?\d+)$/)
   return m ? 'https://auctions.yahoo.co.jp/jp/auction/' + m[1] : null
 }
 
