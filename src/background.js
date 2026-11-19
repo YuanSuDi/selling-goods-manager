@@ -80,16 +80,54 @@ function normalizeMercariUrl(input) {
   return m ? 'https://jp.mercari.com/item/' + m[1] : null
 }
 
-// 同じ商品番号または同じMercari商品IDの再出品タスクが実行待ち・実行中なら true。
-function hasActiveRelistTask(product_no, itemUrl) {
+// Yahoo!オークションの参照商品 URL を正規化する。完全な URL でも、
+// 英字1文字+数字のオークション ID だけでも受け付ける。解釈できなければ null。
+function normalizeYahooUrl(input) {
+  if (!input) return null
+  const s = String(input).trim()
+  const m =
+    s.match(/auctions\.yahoo\.co\.jp\/jp\/auction\/([a-z]\d+)/) ||
+    s.match(/^([a-z]\d+)$/)
+  return m ? 'https://auctions.yahoo.co.jp/jp/auction/' + m[1] : null
+}
+
+// プラットフォームごとの参照まわりの対応表。
+function platformBinding(platform) {
+  return platform === 'yahoo'
+    ? {
+        refField: 'yahoo_ref',
+        autoField: 'yahoo_auto_restock',
+        errorField: 'yahoo_list_error',
+        dedupeField: 'last_processed_yahoo_sale_item_id',
+        normalize: normalizeYahooUrl,
+        refSegment: 'auction/',
+        label: 'Yahoo!オークション',
+      }
+    : {
+        refField: 'mercari_ref',
+        autoField: 'auto_restock',
+        errorField: 'list_error',
+        dedupeField: 'last_processed_sale_item_id',
+        normalize: normalizeMercariUrl,
+        refSegment: 'item/',
+        label: 'Mercari',
+      }
+}
+
+// 同じプラットフォームで、同じ商品番号または同じ商品IDの再出品タスクが
+// 実行待ち・実行中なら true（別プラットフォームのタスクとは競合しない）。
+function hasActiveRelistTask(product_no, itemUrl, platform) {
   if (!managerServer) return false
+  const plat = platform === 'yahoo' ? 'yahoo' : 'mercari'
+  const normalize = platformBinding(plat).normalize
   for (const t of managerServer.tasks.values()) {
     if (
       t.type === 'relist' &&
+      (t.platform || 'mercari') === plat &&
       (t.status === 'pending' || t.status === 'running') &&
       (
         (product_no != null && t.product_no === product_no) ||
-        (itemUrl && normalizeMercariUrl(t.itemUrl) === itemUrl)
+        (itemUrl && normalize(t.itemUrl) === itemUrl)
       )
     ) {
       return true
@@ -99,16 +137,18 @@ function hasActiveRelistTask(product_no, itemUrl) {
 }
 
 // 参照商品をブラウザでコピーして再出品するタスクを作る。
-function createRelistTask(product, autoSubmit, trigger) {
+function createRelistTask(product, autoSubmit, trigger, platform) {
   if (!managerServer) throw new Error('連携サーバが起動していません')
-  const itemUrl = normalizeMercariUrl(product.mercari_ref)
+  const plat = platform === 'yahoo' ? 'yahoo' : 'mercari'
+  const bind = platformBinding(plat)
+  const itemUrl = bind.normalize(product[bind.refField])
   if (!itemUrl) throw new Error('参照商品のURLが未設定です')
-  if (hasActiveRelistTask(product.product_no, itemUrl)) {
-    throw new Error('同じ商品番号またはMercari商品IDの出品タスクが既に実行待ちです')
+  if (hasActiveRelistTask(product.product_no, itemUrl, plat)) {
+    throw new Error('同じ商品番号または' + bind.label + '商品IDの出品タスクが既に実行待ちです')
   }
   const task = managerServer.addTask({
     product_no: product.product_no,
-    platform: 'mercari',
+    platform: plat,
     type: 'relist',
     itemUrl,
     autoSubmit: !!autoSubmit,
@@ -161,6 +201,25 @@ function startManagerServer() {
     persistTask(task)
     sendTaskList()
     if (!task || task.type !== 'relist' || !task.product_no) return
+    if (task.platform === 'yahoo') {
+      // ヤフオクの再出品は同じオークション ID を使い回すため、成功しても
+      // 参照 URL は実質そのまま（新しい ID への差し替えは起きない）。
+      if (task.result && task.result.ok) {
+        const listingUrl =
+          normalizeYahooUrl(task.result.listingUrl) || normalizeYahooUrl(task.itemUrl)
+        const $set = { yahoo_list_error: null }
+        if (listingUrl) $set.yahoo_ref = listingUrl
+        db.update({ product_no: task.product_no }, { $set }, () => refreshRenderer())
+      } else {
+        const msg = (task.result && task.result.message) || '出品に失敗しました'
+        db.update(
+          { product_no: task.product_no },
+          { $set: { yahoo_list_error: msg } },
+          () => refreshRenderer()
+        )
+      }
+      return
+    }
     if (task.result && task.result.ok) {
       const listingUrl = normalizeMercariUrl(task.result.listingUrl)
       const sourceUrl = normalizeMercariUrl(task.itemUrl)
@@ -199,12 +258,14 @@ function startManagerServer() {
   const handleSaleReported = async (sale) => {
     const itemId = String(sale.itemId || '')
     if (!itemId) return { ok: false, matched: false }
+    const platform = sale.platform === 'yahoo' ? 'yahoo' : 'mercari'
+    const bind = platformBinding(platform)
     const escapedItemId = itemId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
     const product = await new Promise((resolve, reject) => {
       db.findOne(
         {
-          mercari_ref: new RegExp(
-            '(?:^|/)item/' + escapedItemId + '(?:[/?#]|$)|^' + escapedItemId + '$',
+          [bind.refField]: new RegExp(
+            '(?:^|/)' + bind.refSegment + escapedItemId + '(?:[/?#]|$)|^' + escapedItemId + '$',
             'i'
           ),
         },
@@ -216,7 +277,7 @@ function startManagerServer() {
     // 同じ出品は一度しか売れないため、処理済みの商品 ID の売却報告は
     // 二度目以降を在庫に反映しない（発送までやることリストに残り続け、
     // スキャンが繰り返し報告しても二重に引かないようにする）。
-    if (product.last_processed_sale_item_id === itemId) {
+    if (product[bind.dedupeField] === itemId) {
       return { ok: true, matched: true, duplicate: true, itemId, product_no: product.product_no }
     }
 
@@ -226,15 +287,15 @@ function startManagerServer() {
       db.update(
         {
           product_no: product.product_no,
-          mercari_ref: product.mercari_ref,
-          last_processed_sale_item_id: { $ne: itemId },
+          [bind.refField]: product[bind.refField],
+          [bind.dedupeField]: { $ne: itemId },
         },
         {
           $set: {
             sku: newSku,
             selled_num: newSoldNum,
-            list_error: null,
-            last_processed_sale_item_id: itemId,
+            [bind.errorField]: null,
+            [bind.dedupeField]: itemId,
           },
         },
         {},
@@ -244,12 +305,13 @@ function startManagerServer() {
     if (!updatedCount) {
       return { ok: true, matched: false, itemId }
     }
-    if (newSku > 0 && product.auto_restock && product.mercari_ref) {
+    if (newSku > 0 && product[bind.autoField] && product[bind.refField]) {
       try {
         createRelistTask(
           Object.assign({}, product, { sku: newSku, selled_num: newSoldNum }),
           true,
-          'mercari-todo'
+          platform === 'yahoo' ? 'yahoo-sold' : 'mercari-todo',
+          platform
         )
       } catch (e) {
         console.warn('[manager] sale restock skipped:', e && e.message)
@@ -259,6 +321,7 @@ function startManagerServer() {
     if (window && !window.isDestroyed()) {
       window.webContents.send('sale_reported', {
         ok: true,
+        platform,
         itemId,
         product_no: product.product_no,
         sku: newSku,
@@ -599,6 +662,48 @@ async function createWindow() {
     })
   })
 
+  ipcMain.on('bind_yahoo_item', (e, data) => {
+    const binding = data || {}
+    const productNo = String(binding.product_no || '').trim()
+    const rawItemUrl = String(binding.itemUrl || '').trim()
+    const itemUrl = rawItemUrl ? normalizeYahooUrl(rawItemUrl) : null
+    const autoRestock = !!binding.auto_restock
+    if (!productNo) {
+      e.sender.send('yahoo_binding_saved', { ok: false, error: '商品管理番号が指定されていません。' })
+      return
+    }
+    if ((rawItemUrl && !itemUrl) || (autoRestock && !itemUrl)) {
+      e.sender.send('yahoo_binding_saved', {
+        ok: false,
+        error: '有効な Yahoo!オークション商品 URL またはオークション ID を入力してください。',
+      })
+      return
+    }
+    db.findOne({ product_no: productNo }, (findErr, product) => {
+      if (findErr || !product) {
+        if (findErr) console.error('[manager] failed to find product for Yahoo binding:', findErr)
+        e.sender.send('yahoo_binding_saved', {
+          ok: false,
+          error: findErr ? '商品情報の読み込みに失敗しました。' : '商品が見つかりません。',
+        })
+        return
+      }
+      const $set = { yahoo_ref: itemUrl, yahoo_auto_restock: autoRestock }
+      db.update({ product_no: product.product_no }, { $set }, (updateErr) => {
+        if (updateErr) {
+          console.error('[manager] failed to save Yahoo binding:', updateErr)
+          e.sender.send('yahoo_binding_saved', {
+            ok: false,
+            error: 'Yahoo 绑定保存失败。',
+          })
+          return
+        }
+        refreshRenderer()
+        e.sender.send('yahoo_binding_saved', { ok: true, itemUrl, autoRestock })
+      })
+    })
+  })
+
   //現在のタスク一覧を返す
   ipcMain.on('list_tasks', () => {
     sendTaskList()
@@ -622,11 +727,13 @@ async function createWindow() {
   ipcMain.on('task_start', (e, taskId) => {
     const task = managerServer && managerServer.tasks.get(taskId)
     if (task && (task.status === 'stopped' || task.status === 'failed')) {
+      const bind = platformBinding(task.platform)
       const dup =
         task.type === 'relist' &&
         hasActiveRelistTask(
           task.product_no,
-          normalizeMercariUrl(task.itemUrl)
+          bind.normalize(task.itemUrl),
+          task.platform
         )
       if (!dup) {
         task.status = 'pending'
@@ -635,7 +742,7 @@ async function createWindow() {
         if (task.type === 'relist' && task.product_no) {
           db.update(
             { product_no: task.product_no },
-            { $set: { list_error: null } },
+            { $set: { [bind.errorField]: null } },
             () => refreshRenderer()
           )
         }

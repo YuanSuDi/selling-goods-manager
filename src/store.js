@@ -273,6 +273,35 @@ export const saveMercariBinding = () => {
   })
 }
 
+// ---- Yahoo!オークション商品の自動出品バインド ----
+export const yahooBindingFlag = ref(false)
+export const yahooBindingProductNo = ref('')
+export const yahooBindingUrl = ref('')
+export const yahooBindingAutoRestock = ref(false)
+export const yahooBindingPending = ref(false)
+export const openYahooBinding = (product_no) => {
+  for (let i = 0; i < dataSource.value.length; i++) {
+    if (dataSource.value[i].product_no === product_no) {
+      yahooBindingProductNo.value = product_no
+      yahooBindingUrl.value = dataSource.value[i].yahoo_ref || ''
+      yahooBindingAutoRestock.value = dataSource.value[i].yahoo_ref
+        ? !!dataSource.value[i].yahoo_auto_restock
+        : true
+      yahooBindingPending.value = false
+      yahooBindingFlag.value = true
+      break
+    }
+  }
+}
+export const saveYahooBinding = () => {
+  yahooBindingPending.value = true
+  window.ipcRenderer.send('bind_yahoo_item', {
+    product_no: yahooBindingProductNo.value,
+    itemUrl: yahooBindingUrl.value.trim(),
+    auto_restock: yahooBindingAutoRestock.value,
+  })
+}
+
 // ---- 連携情報モーダル ----
 export const mgrInfoFlag = ref(false)
 export const mgrInfo = ref({})
@@ -296,6 +325,19 @@ ipc.on('mercari_binding_saved', (e, result) => {
     alertDisFlg.value = true
   }
 })
+ipc.on('yahoo_binding_saved', (e, result) => {
+  yahooBindingPending.value = false
+  if (result && result.ok) {
+    yahooBindingFlag.value = false
+    successMsg.value = result.itemUrl
+      ? `ヤフオク参照を保存しました。${result.autoRestock ? '売却検出後に自動出品します。' : '自动补货已关闭。'}`
+      : 'ヤフオク参照を解除しました。'
+    successFlg.value = true
+  } else {
+    alertMsg.value = (result && result.error) || 'Yahoo!オークション商品のバインドに失敗しました。'
+    alertDisFlg.value = true
+  }
+})
 
 // ---- 出品タスク（ヘッダーのバッジとモーダルで共有） ----
 export const taskModalFlag = ref(false)
@@ -314,7 +356,8 @@ ipc.on('tasks_list', (e, list) => {
 ipc.send('list_tasks')
 
 ipc.on('sale_reported', (e, sale) => {
-  successMsg.value = `Mercari売却を検出しました（${sale.product_no}、在庫残 ${sale.sku}）`
+  const platformName = sale && sale.platform === 'yahoo' ? 'ヤフオク' : 'Mercari'
+  successMsg.value = `${platformName}売却を検出しました（${sale.product_no}、在庫残 ${sale.sku}）`
   successFlg.value = true
 })
 

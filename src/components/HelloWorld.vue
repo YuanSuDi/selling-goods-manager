@@ -12,6 +12,7 @@
   import ProductImageDownload from './ProductImageDownload.vue';
   import EditProductModal from './EditProductModal.vue';
   import MercariBindingModal from './MercariBindingModal.vue';
+  import YahooBindingModal from './YahooBindingModal.vue';
   import ManagerInfoModal from './ManagerInfoModal.vue';
   import TaskManagerModal from './TaskManagerModal.vue';
 
@@ -113,6 +114,7 @@
 
     <EditProductModal />
     <MercariBindingModal />
+    <YahooBindingModal />
     <ManagerInfoModal />
     <TaskManagerModal />
   </div>

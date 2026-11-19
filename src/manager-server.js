@@ -202,17 +202,26 @@ function createManagerServer(options) {
 
       if (req.method === "POST" && pathname === "/api/sales/report") {
         const body = await readBody(req);
+        const platform = body.platform === "yahoo" ? "yahoo" : "mercari";
         const itemId = body.itemId
           ? String(body.itemId).trim()
-          : String(body.listingUrl || "").match(/\/item\/(m[A-Za-z0-9]+)/)?.[1] || null;
+          : platform === "yahoo"
+            ? String(body.listingUrl || "").match(/\/jp\/auction\/([a-zA-Z][0-9]+)/)?.[1] || null
+            : String(body.listingUrl || "").match(/\/item\/(m[A-Za-z0-9]+)/)?.[1] || null;
         if (!itemId) {
           return sendJson(res, 400, { ok: false, error: "itemId or listingUrl is required" });
         }
-        if (body.statusText && !String(body.statusText).includes("発送をお願いします")) {
-          return sendJson(res, 200, { ok: true, ignored: true, itemId });
+        // 状態テキストの関門はプラットフォームごと:
+        // Mercari は「発送をお願いします」、ヤフオクは発送を促す文言（「発送」を含む）。
+        if (body.statusText) {
+          const st = String(body.statusText);
+          const passes = platform === "yahoo" ? st.includes("発送") : st.includes("発送をお願いします");
+          if (!passes) {
+            return sendJson(res, 200, { ok: true, ignored: true, itemId });
+          }
         }
         const result = onSaleReported
-          ? await onSaleReported(Object.assign({}, body, { itemId }))
+          ? await onSaleReported(Object.assign({}, body, { itemId, platform }))
           : { ok: false, matched: false };
         return sendJson(res, 200, Object.assign({ ok: true, itemId }, result || {}));
       }

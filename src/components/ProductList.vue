@@ -4,7 +4,7 @@
   import { cloneDeep } from 'lodash-es';
   import {
     NO_IMAGE, dataSource, isLoading, lodingTip, currentItemNo,
-    urlClick, openImgDir, selledItem, editInfo, openMercariBinding,
+    urlClick, openImgDir, selledItem, editInfo, openMercariBinding, openYahooBinding,
     listSearch,
   } from '../store';
   import { normalizeProductImageUrl } from '../utils/product-image'
@@ -97,6 +97,13 @@
     title: 'メルカリ参照',
     dataIndex: 'mercari_ref',
     key: 'mercari_ref',
+    width: 140,
+    resizable: true,
+  },
+  {
+    title: 'ヤフオク参照',
+    dataIndex: 'yahoo_ref',
+    key: 'yahoo_ref',
     width: 140,
     resizable: true,
   },
@@ -280,6 +287,7 @@
         <div class="ops">
           <div class="ops-row">
             <a-button type="primary" size="small" @click="openMercariBinding(record.product_no)">自动出品绑定</a-button>
+            <a-button size="small" @click="openYahooBinding(record.product_no)">雅虎绑定</a-button>
             <a-button v-if="record.sku != 0" size="small" @click="selledItem(record.product_no)">一つ売り</a-button>
             <a-button size="small" @click="addProduct(record.product_no)">入荷</a-button>
           </div>
@@ -296,6 +304,16 @@
           <div class="ref-tags">
             <a-tag v-if="record.list_error" color="red">出品エラー</a-tag>
             <a-tag v-else-if="record.auto_restock" color="green">自動補充</a-tag>
+          </div>
+        </div>
+        <span v-else class="ref-none">未設定</span>
+      </template>
+      <template v-else-if="column.key === 'yahoo_ref'">
+        <div v-if="record.yahoo_ref" class="ref-cell">
+          <a class="link" @click="urlClick(record.yahoo_ref)">{{ record.yahoo_ref.split('/').pop() }}</a>
+          <div class="ref-tags">
+            <a-tag v-if="record.yahoo_list_error" color="red">出品エラー</a-tag>
+            <a-tag v-else-if="record.yahoo_auto_restock" color="green">自動補充</a-tag>
           </div>
         </div>
         <span v-else class="ref-none">未設定</span>
