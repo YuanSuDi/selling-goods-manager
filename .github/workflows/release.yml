@@ -52,14 +52,20 @@ jobs:
             throw "Windows installer for version $version was not produced"
           }
           $blockmap = Get-Item "$($installer.FullName).blockmap" -ErrorAction Stop
+          $portableArchive = Get-ChildItem "dist_electron" -Filter "*.zip" | Select-Object -First 1
+          if (-not $portableArchive) {
+            throw "Portable ZIP for version $version was not produced"
+          }
           $installerName = "selling-goods-manager-product-by-Yuan-Setup-$version.exe"
+          $archiveName = "selling-goods-manager-portable-$version.zip"
           Copy-Item $installer.FullName (Join-Path $publishDir $installerName)
           Copy-Item $blockmap.FullName (Join-Path $publishDir "$($installerName).blockmap")
+          Copy-Item $portableArchive.FullName (Join-Path $publishDir $archiveName)
           Copy-Item "dist_electron/latest.yml" (Join-Path $publishDir "latest.yml")
 
           gh release view $tag --repo $env:GITHUB_REPOSITORY 2>$null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --title $tag --notes "Windows installer release $tag." --verify-tag --repo $env:GITHUB_REPOSITORY
+            gh release create $tag --title $tag --notes "Windows installer and portable ZIP release $tag." --verify-tag --repo $env:GITHUB_REPOSITORY
             if ($LASTEXITCODE -ne 0) {
               throw "Could not create GitHub Release $tag"
             }
@@ -67,6 +73,7 @@ jobs:
           gh release upload $tag `
             (Join-Path $publishDir $installerName) `
             (Join-Path $publishDir "$($installerName).blockmap") `
+            (Join-Path $publishDir $archiveName) `
             (Join-Path $publishDir "latest.yml") `
             --clobber `
             --repo $env:GITHUB_REPOSITORY
@@ -77,7 +84,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Could not verify assets for GitHub Release $tag"
           }
-          foreach ($asset in @($installerName, "$($installerName).blockmap", "latest.yml")) {
+          foreach ($asset in @($installerName, "$($installerName).blockmap", $archiveName, "latest.yml")) {
             if ($uploadedAssets -notcontains $asset) {
               throw "GitHub Release $tag is missing asset $asset"
             }

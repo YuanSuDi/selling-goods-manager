@@ -22,7 +22,7 @@ function createProtocol(scheme) {
 }
 import axios from 'axios';
 import path from 'path';
-import puppeteer from 'puppeteer';
+import puppeteer from 'puppeteer-core';
 import crypto from 'crypto';
 import Datastore from 'nedb';
 import { createManagerServer } from './manager-server';

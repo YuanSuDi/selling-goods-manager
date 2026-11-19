@@ -11,7 +11,7 @@ yarn install --ignore-engines
 yarn electron:serve
 ```
 
-构建 Windows 安装包：
+构建 Windows 安装包和便携 ZIP：
 
 ```powershell
 yarn electron:build
@@ -32,9 +32,9 @@ yarn electron:build
 发布步骤：
 
 1. 在 `package.json` 中设置新版本号。
-2. 推送对应版本标签，例如 `v0.1.2`。
-3. GitHub Actions 的 `Publish Windows release` 工作流会构建 NSIS 安装包，并发布安装包及 electron-builder 更新元数据。
+2. 推送对应版本标签，例如 `v0.1.3`。
+3. GitHub Actions 的 `Publish Windows release` 工作流会构建 NSIS 安装包和便携 ZIP，并发布安装包、ZIP 及 electron-builder 更新元数据。
 
-工作流使用 GitHub 提供的 `GITHUB_TOKEN`，不会把个人访问令牌写入程序。旧版程序不含自动更新功能，用户需要先手动安装首个支持自动更新的版本。
+工作流使用 GitHub 提供的 `GITHUB_TOKEN`，不会把个人访问令牌写入程序。便携 ZIP 用于免安装测试，需手动替换版本；自动安装更新适用于 NSIS 安装版。旧版程序不含自动更新功能，用户需要先手动安装首个支持自动更新的版本。
 
 首次启动时，旧版 `userdata/` 和 `img/` 会被复制到应用数据目录，原文件会保留。如果新旧数据同时存在，程序会报错停止，不会覆盖任一份数据。
