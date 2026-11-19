@@ -5,6 +5,7 @@ import  fs   from 'fs'
 import { exec  } from 'child_process'
 import { pathToFileURL } from 'url'
 import { pipeline } from 'stream/promises'
+import { autoUpdater } from 'electron-updater'
 
 // createProtocol の自前実装（旧 vue-cli-plugin-electron-builder/lib の置き換え）。
 // 新しい Electron では registerFileProtocol が廃止されたため protocol.handle を使う。
@@ -19,7 +20,6 @@ function createProtocol(scheme) {
     return net.fetch(pathToFileURL(path.join(__dirname, filePath)).href)
   })
 }
-import { db,getAll } from './nedb/db'
 import axios from 'axios';
 import path from 'path';
 import puppeteer from 'puppeteer';
@@ -27,9 +27,14 @@ import crypto from 'crypto';
 import Datastore from 'nedb';
 import { createManagerServer } from './manager-server';
 import { productImagePathFromRequest } from './utils/product-image'
+const { prepareUserDataDirectory } = require('./utils/user-data')
 
 
 const isDevelopment = process.env.NODE_ENV !== 'production'
+let db = null
+let getAll = null
+let tasksDb = null
+let userDataDir = ''
 
 function getChromiumExecutablePath() {
   const chromiumRelativePath = path.join(
@@ -60,10 +65,9 @@ function reportImageWorkflowError(sender, operation, error) {
 
 // ---- 出品管理プログラム連携サーバ（FurimaCopy 拡張との通信、v0.9.0） --------
 // localhost 専用の小さな HTTP サーバを立て、拡張機能へ「自動出品タスク」を
-// 渡す。トークンは初回起動時に生成して userdata/manager.json に保存する
+// 渡す。トークンは初回起動時に生成してユーザーデータ領域に保存する
 // （拡張機能のポップアップに同じトークンを入力して使う）。
-// タスクは userdata/tasks.db にも保存し、再起動時に pending 分を復元する。
-const tasksDb = new Datastore({ filename: './userdata/tasks.db', autoload: true })
+// タスクは tasks.db にも保存し、再起動時に pending 分を復元する。
 let managerServer = null
 let managerInfo = { port: 17341, token: '', running: false }
 
@@ -134,13 +138,17 @@ function sendTaskList() {
 
 function startManagerServer() {
   if (managerServer) return
-  const cfgPath = path.join('./userdata', 'manager.json')
+  const cfgPath = path.join(userDataDir, 'manager.json')
   let cfg = {}
-  try { cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8')) } catch (e) {}
+  try {
+    cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'))
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error
+  }
   if (!cfg.token) {
     cfg.token = crypto.randomBytes(16).toString('hex')
     cfg.port = cfg.port || 17341
-    try { fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2)) } catch (e) {}
+    fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2))
   }
   managerInfo = { port: cfg.port || 17341, token: cfg.token, running: false }
   const persistTask = (task) => {
@@ -645,7 +653,96 @@ app.on('activate', () => {
   if (BrowserWindow.getAllWindows().length === 0) createWindow()
 })
 
-app.whenReady().then(() => {
+function findLegacyDataRoot() {
+  const candidates = app.isPackaged
+    ? [path.dirname(app.getPath('exe')), process.cwd()]
+    : [process.cwd()]
+  const roots = [...new Set(candidates.map((candidate) => path.resolve(candidate)))]
+  const dataRoot = roots.find((root) => {
+    const legacyData = path.join(root, 'userdata')
+    return fs.existsSync(legacyData) && fs.readdirSync(legacyData).length > 0
+  })
+  return dataRoot || roots.find((root) => fs.existsSync(path.join(root, 'img'))) || roots[0]
+}
+
+let lastUpdaterError = ''
+let lastUpdaterErrorAt = 0
+
+function reportUpdaterError(error) {
+  const detail = error && error.message ? error.message : String(error)
+  const now = Date.now()
+  if (detail === lastUpdaterError && now - lastUpdaterErrorAt < 2000) return
+  lastUpdaterError = detail
+  lastUpdaterErrorAt = now
+  console.error('[updater] failed', error)
+  const options = {
+    type: 'warning',
+    title: '更新检查失败',
+    message: '暂时无法检查或下载更新。',
+    detail,
+    buttons: ['关闭'],
+  }
+  if (window && !window.isDestroyed()) {
+    dialog.showMessageBox(window, options).catch((dialogError) => {
+      console.error('[updater] failed to show error dialog', dialogError)
+    })
+  } else {
+    dialog.showErrorBox(options.title, `${options.message}\n\n${detail}`)
+  }
+}
+
+function setupAutoUpdater() {
+  if (!app.isPackaged) return
+
+  autoUpdater.autoDownload = true
+  autoUpdater.autoInstallOnAppQuit = true
+  autoUpdater.allowPrerelease = false
+  autoUpdater.on('update-available', (info) => {
+    console.info(`[updater] version ${info.version} is available`)
+  })
+  autoUpdater.on('update-not-available', (info) => {
+    console.info(`[updater] already on the latest version ${info.version}`)
+  })
+  autoUpdater.on('update-downloaded', (info) => {
+    const options = {
+      type: 'info',
+      title: '更新已下载',
+      message: `新版本 ${info.version} 已下载完成。`,
+      detail: '现在重启安装，或稍后退出程序时自动安装。',
+      buttons: ['立即重启', '稍后'],
+      defaultId: 0,
+      cancelId: 1,
+    }
+    const prompt = window && !window.isDestroyed()
+      ? dialog.showMessageBox(window, options)
+      : dialog.showMessageBox(options)
+    prompt.then(({response}) => {
+      if (response === 0) autoUpdater.quitAndInstall()
+    }).catch((error) => {
+      console.error('[updater] failed to show downloaded update dialog', error)
+    })
+  })
+  autoUpdater.on('error', reportUpdaterError)
+  autoUpdater.checkForUpdates().catch(reportUpdaterError)
+}
+
+app.whenReady().then(async () => {
+  const preparedData = await prepareUserDataDirectory(
+    app.getPath('userData'),
+    findLegacyDataRoot()
+  )
+  userDataDir = preparedData.dataDirectory
+  if (preparedData.migrated) {
+    console.info('[storage] Legacy user data copied to the application data directory')
+  }
+  const database = require('./nedb/db')
+  db = database.initializeDatabase(userDataDir)
+  getAll = database.getAll
+  tasksDb = new Datastore({
+    filename: path.join(userDataDir, 'tasks.db'),
+    autoload: true,
+  })
+
   // Register before creating the window so renderer image requests cannot race
   // protocol setup.
   const contentTypes = {
@@ -676,6 +773,7 @@ app.whenReady().then(() => {
         return new Response('bad path', { status: 400 })
       }
       const candidates = [
+        path.join(userDataDir, rel),
         path.resolve(rel),
         path.join(path.dirname(app.getPath('exe')), rel),
         path.join(app.getAppPath(), rel),
@@ -701,7 +799,13 @@ app.whenReady().then(() => {
   })
 
   startManagerServer()
-  createWindow()
+  await createWindow()
+  setupAutoUpdater()
+}).catch((error) => {
+  console.error('[startup] failed', error)
+  const detail = error && error.message ? error.message : String(error)
+  dialog.showErrorBox('启动失败', `无法安全准备应用数据：\n\n${detail}`)
+  app.quit()
 })
 
 // Exit cleanly on request from parent process in development mode.
@@ -778,7 +882,7 @@ async function downloadImg(url, folderPath) {
   //console.log(src)
   //主图 #landingImage
   await downloadFile(src, folderPath)
-  await downloadFile(src, "./img")
+  await downloadFile(src, path.join(userDataDir, 'img'))
   data.mainImgPath = "imgp://../img/".concat(src.split("/")[src.split("/").length-1])
   //获取点击列表
   let titles = await page.$$("#ivThumbs > div.ivRow>div.ivThumb");

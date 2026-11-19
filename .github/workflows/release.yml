@@ -1,0 +1,40 @@
+name: Publish Windows release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: yarn
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile --ignore-engines
+
+      - name: Prepare Puppeteer Chromium
+        shell: pwsh
+        run: |
+          $source = "node_modules/puppeteer/.local-chromium/win64-1045629"
+          if (-not (Test-Path "$source/chrome-win/chrome.exe")) {
+            throw "Puppeteer Chromium revision 1045629 was not installed at $source"
+          }
+          New-Item -ItemType Directory -Force "app/.local-chromium" | Out-Null
+          Copy-Item -Recurse -Force $source "app/.local-chromium/"
+
+      - name: Build and publish
+        run: yarn electron:build --publish always
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

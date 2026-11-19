@@ -1,24 +1,35 @@
 var NeDB = require('nedb')
+var path = require('path')
 
-var db = new NeDB({
-    filename: './userdata/user.db',
-    autoload: true,
-})
+var db = null
 
+function initializeDatabase(dataDirectory) {
+    if (db) throw new Error('Database has already been initialized')
+    db = new NeDB({
+        filename: path.join(dataDirectory, 'user.db'),
+        autoload: true,
+    })
+    return db
+}
+
+function getDatabase() {
+    if (!db) throw new Error('Database has not been initialized')
+    return db
+}
 
 function insert(data) {
-    db.insert(data, function(err, doc) {
+    getDatabase().insert(data, function(err, doc) {
         console.log('inserted:', doc)
     })
 }
 
 function getAll(){
-    return db.getAllData()
+    return getDatabase().getAllData()
 }
 
 function getProductByName(searchName){
     console.log(searchName)
-    db.find({"$or":[{product_name: new RegExp(searchName, 'i')}, {product_content: new RegExp(searchName, 'i')}] }, (err, docs) => {
+    getDatabase().find({"$or":[{product_name: new RegExp(searchName, 'i')}, {product_content: new RegExp(searchName, 'i')}] }, (err, docs) => {
         if (err) {
             console.error('Error executing query:', err);
             return;
@@ -27,4 +38,4 @@ function getProductByName(searchName){
     });
 }
 
-export   {db, getAll, getProductByName}
+export {db, initializeDatabase, getAll, getProductByName}
