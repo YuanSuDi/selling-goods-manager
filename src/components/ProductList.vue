@@ -289,7 +289,7 @@
       <template v-else-if="column.key === 'do'">
         <div class="ops">
           <div class="ops-row">
-            <a-button v-if="record.sku != 0" size="small" @click="selledItem(record.product_no)">一つ売り</a-button>
+            <a-button v-if="record.sku != 0" size="small" @click="selledItem(record.product_no)">1件販売</a-button>
             <a-button size="small" @click="addProduct(record.product_no)">入荷</a-button>
           </div>
           <div class="ops-row">
