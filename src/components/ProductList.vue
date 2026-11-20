@@ -14,9 +14,22 @@
   } from '../store';
   import { normalizeProductImageUrl } from '../utils/product-image'
 
+  // ---- 自動補充フィルタ（検索結果に重ねる表示フィルタ） ----
+  const autoFilter = ref('all')
+  const hasAutoRestock = (p) => {
+    const recs = recordsFor(p.product_no)
+    if (recs.length) return recs.some((r) => r.auto_restock)
+    return !!p.auto_restock
+  }
+  const visibleData = computed(() => {
+    if (autoFilter.value === 'auto') return dataSource.value.filter(hasAutoRestock)
+    if (autoFilter.value === 'none') return dataSource.value.filter((p) => !hasAutoRestock(p))
+    return dataSource.value
+  })
+
   const pagination = ref({
     position: ['bottomRight'],
-    showTotal: () => `トータル件数： ${dataSource.value.length} 件`
+    showTotal: () => `トータル件数： ${visibleData.value.length} 件`
   })
 
   const compareStrings = (str1, str2) => {
@@ -407,9 +420,18 @@
       enter-button
       @search="onSearchByName"
     />
+    <a-select
+      v-model:value="autoFilter"
+      style="width: 170px"
+      :options="[
+        { value: 'all', label: '自動補充：すべて' },
+        { value: 'auto', label: '自動補充：あり' },
+        { value: 'none', label: '自動補充：なし' },
+      ]"
+    ></a-select>
   </div>
 
-  <a-table :dataSource="dataSource" :columns="columns" rowKey="product_no" :pagination="pagination" :scroll="{ x: 1440 }">
+  <a-table :dataSource="visibleData" :columns="columns" rowKey="product_no" :pagination="pagination" :scroll="{ x: 1440 }">
     <template #expandedRowRender="{ record }">
       <div class="expanded">
         <div class="expanded-name">{{ record.product_name }}</div>
