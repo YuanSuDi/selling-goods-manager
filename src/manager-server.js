@@ -15,7 +15,15 @@
 //   POST /api/tasks                タスク作成（プログラムの UI から）
 //   POST /api/tasks/:id/claim      拡張が実行開始を宣言（二重実行防止）
 //   POST /api/tasks/:id/result     拡張が結果を報告 { ok, listingUrl?, message? }
+//   POST /api/tasks/:id/release    拡張が claim 済みタスクをキューへ返す
+//   POST /api/claims               所有権の自己申告（認領） { platform, listingId, taskId? }
 //   GET  /api/image?path=<abs>     ローカル画像ファイルを拡張へ配信
+//
+// ノード（v0.2.0）:
+//   拡張は各リクエストに x-fc-node ヘッダで自動生成ノード ID を付ける。
+//   タスクの node_id がそのノード専用なら、そのノードにしか見えない。
+//   node_id が空のタスクは「既定プール」で、名前未登録のノードと
+//   ヘッダなし（旧拡張）にだけ見える。node_id '*' は全ノード宛（所有権確認用）。
 //
 // タスクの形:
 //   { id, product_no, platform: "mercari"|"paypay"|"rakuma"|"yahoo",
@@ -49,6 +57,10 @@ function createManagerServer(options) {
   const onTaskCreated = typeof opts.onTaskCreated === "function" ? opts.onTaskCreated : null;
   const onTaskResult = typeof opts.onTaskResult === "function" ? opts.onTaskResult : null;
   const onSaleReported = typeof opts.onSaleReported === "function" ? opts.onSaleReported : null;
+  const onNodeSeen = typeof opts.onNodeSeen === "function" ? opts.onNodeSeen : null;
+  const getNodeInfo = typeof opts.getNodeInfo === "function" ? opts.getNodeInfo : null;
+  const onOwnershipClaim = typeof opts.onOwnershipClaim === "function" ? opts.onOwnershipClaim : null;
+  const onTaskReleased = typeof opts.onTaskReleased === "function" ? opts.onTaskReleased : null;
 
   const tasks = new Map();
   const taskImagePaths = new Set();
@@ -60,9 +72,9 @@ function createManagerServer(options) {
     if (!body || !body.platform) {
       throw new Error("platform is required");
     }
-    const type = body.type === "relist" ? "relist" : "listing";
-    if (type === "relist" && !body.itemUrl) {
-      throw new Error("itemUrl is required for relist tasks");
+    const type = body.type === "relist" ? "relist" : body.type === "verify" ? "verify" : "listing";
+    if ((type === "relist" || type === "verify") && !body.itemUrl) {
+      throw new Error("itemUrl is required for relist/verify tasks");
     }
     if (type === "listing" && !body.title) {
       throw new Error("title is required");
@@ -74,7 +86,14 @@ function createManagerServer(options) {
       platform: body.platform,
       type,
       trigger: body.trigger || "manual",
-      itemUrl: type === "relist" ? String(body.itemUrl) : null,
+      // v0.2.0: 出品レコードとの紐付けと、担当ノード。
+      // node_id: '' = 既定プール / '*' = 全ノード（所有権確認）/ それ以外は専用。
+      condition_id: body.condition_id || null,
+      listing_id: body.listing_id || null,
+      node_id: body.node_id != null ? String(body.node_id) : "",
+      attemptedBy: [],
+      claimedBy: null,
+      itemUrl: type === "relist" || type === "verify" ? String(body.itemUrl) : null,
       title: body.title
         ? String(body.title)
         : type === "relist"
@@ -142,6 +161,35 @@ function createManagerServer(options) {
     );
   }
 
+  // リクエスト元ノード（x-fc-node）から見て、そのタスクが対象かどうか。
+  // nodeId が null（ヘッダなし＝旧拡張）は既定プール扱い。
+  function nodeInfoOf(nodeId) {
+    if (!nodeId) return null;
+    try {
+      return getNodeInfo ? getNodeInfo(nodeId) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+  function isNamedNode(nodeId) {
+    const info = nodeInfoOf(nodeId);
+    return !!(info && info.name);
+  }
+  function taskVisibleTo(task, nodeId) {
+    if (task.node_id === "*") {
+      // 所有権確認は全ノード宛。ただし既に試したノードには二度出さない。
+      return !(task.attemptedBy || []).includes(nodeId);
+    }
+    if (task.node_id) return task.node_id === nodeId;
+    // 既定プール: 名前付きノードには見せない（担当分離を守る）。
+    return !isNamedNode(nodeId);
+  }
+  function nodePayload(nodeId) {
+    if (!nodeId) return null;
+    const info = nodeInfoOf(nodeId);
+    return { id: nodeId, name: info ? info.name || null : null };
+  }
+
   const server = http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url, "http://127.0.0.1");
@@ -151,16 +199,26 @@ function createManagerServer(options) {
         return sendJson(res, 401, { ok: false, error: "unauthorized" });
       }
 
+      const reqNodeId = req.headers["x-fc-node"] ? String(req.headers["x-fc-node"]) : null;
+      if (reqNodeId && onNodeSeen) {
+        try {
+          onNodeSeen(reqNodeId);
+        } catch (e) { /* 登録簿の更新失敗で本体を止めない */ }
+      }
+
       if (req.method === "GET" && pathname === "/api/ping") {
-        return sendJson(res, 200, { ok: true, app: "selling-goods-manager", version: 1 });
+        return sendJson(res, 200, { ok: true, app: "selling-goods-manager", version: 2, node: nodePayload(reqNodeId) });
       }
 
       if (req.method === "GET" && pathname === "/api/tasks") {
         const status = url.searchParams.get("status");
-        const list = Array.from(tasks.values()).filter(
+        let list = Array.from(tasks.values()).filter(
           (t) => !status || t.status === status
         );
-        return sendJson(res, 200, { ok: true, tasks: list });
+        if (!status || status === "pending") {
+          list = list.filter((t) => taskVisibleTo(t, reqNodeId));
+        }
+        return sendJson(res, 200, { ok: true, tasks: list, node: nodePayload(reqNodeId) });
       }
 
       if (req.method === "POST" && pathname === "/api/tasks") {
@@ -180,8 +238,70 @@ function createManagerServer(options) {
         if (task.status !== "pending") {
           return sendJson(res, 409, { ok: false, error: "task already " + task.status });
         }
+        if (!taskVisibleTo(task, reqNodeId)) {
+          return sendJson(res, 403, { ok: false, error: "task is assigned to another node" });
+        }
+        if (task.type === "verify") {
+          // 所有権確認は複数ノードが試すものなので、claim でロックしない。
+          return sendJson(res, 200, { ok: true, task });
+        }
         task.status = "running";
+        task.claimedBy = reqNodeId;
         return sendJson(res, 200, { ok: true, task });
+      }
+
+      const releaseMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/release$/);
+      if (req.method === "POST" && releaseMatch) {
+        const task = tasks.get(decodeURIComponent(releaseMatch[1]));
+        if (!task) return sendJson(res, 404, { ok: false, error: "task not found" });
+        const body = await readBody(req);
+        if (task.status !== "running") {
+          return sendJson(res, 409, { ok: false, error: "task is not running" });
+        }
+        if (task.claimedBy && reqNodeId && task.claimedBy !== reqNodeId) {
+          return sendJson(res, 403, { ok: false, error: "task is claimed by another node" });
+        }
+        task.status = "pending";
+        task.claimedBy = null;
+        task.releaseNote = {
+          by: reqNodeId,
+          reason: body.reason || null,
+          at: new Date().toISOString(),
+        };
+        if (onTaskReleased) onTaskReleased(task);
+        return sendJson(res, 200, { ok: true, task });
+      }
+
+      if (req.method === "POST" && pathname === "/api/claims") {
+        const body = await readBody(req);
+        const platform = body.platform === "yahoo" ? "yahoo" : "mercari";
+        const listingId = body.listingId
+          ? String(body.listingId).trim()
+          : platform === "yahoo"
+            ? String(body.listingUrl || "").match(/\/jp\/auction\/([a-zA-Z]?[0-9]+)/)?.[1] || null
+            : String(body.listingUrl || "").match(/\/item\/(m[A-Za-z0-9]+)/)?.[1] || null;
+        if (!listingId) {
+          return sendJson(res, 400, { ok: false, error: "listingId or listingUrl is required" });
+        }
+        const claimResult = onOwnershipClaim
+          ? await onOwnershipClaim({ nodeId: reqNodeId, platform, listingId, taskId: body.taskId || null })
+          : { ok: false, assigned: false };
+        // 紐付く所有権確認タスクがあれば完了にする。
+        if (claimResult && claimResult.assigned && body.taskId) {
+          const task = tasks.get(String(body.taskId));
+          if (task && task.type === "verify" && task.status === "pending") {
+            task.status = "done";
+            task.result = {
+              ok: true,
+              listingUrl: task.itemUrl || null,
+              message: "所有権を確認しました",
+              at: new Date().toISOString(),
+              executedBy: reqNodeId,
+            };
+            if (onTaskResult) onTaskResult(task);
+          }
+        }
+        return sendJson(res, 200, Object.assign({ ok: true, listingId }, claimResult || {}));
       }
 
       const resultMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/result$/);
@@ -189,11 +309,19 @@ function createManagerServer(options) {
         const task = tasks.get(decodeURIComponent(resultMatch[1]));
         if (!task) return sendJson(res, 404, { ok: false, error: "task not found" });
         const body = await readBody(req);
+        // 所有権確認で「自分の商品ではない」と分かった場合は、タスクを
+        // 失敗にせず、このノードには二度出さないようにして pending のまま残す。
+        if (task.type === "verify" && body.notOwner) {
+          task.attemptedBy = Array.from(new Set([...(task.attemptedBy || []), reqNodeId]));
+          if (onTaskReleased) onTaskReleased(task);
+          return sendJson(res, 200, { ok: true, task, notOwner: true });
+        }
         task.result = {
           ok: !!body.ok,
           listingUrl: body.listingUrl || null,
           message: body.message || null,
           at: new Date().toISOString(),
+          executedBy: reqNodeId,
         };
         task.status = body.ok ? "done" : "failed";
         if (onTaskResult) onTaskResult(task);
@@ -221,7 +349,7 @@ function createManagerServer(options) {
           }
         }
         const result = onSaleReported
-          ? await onSaleReported(Object.assign({}, body, { itemId, platform }))
+          ? await onSaleReported(Object.assign({}, body, { itemId, platform, nodeId: reqNodeId }))
           : { ok: false, matched: false };
         return sendJson(res, 200, Object.assign({ ok: true, itemId }, result || {}));
       }

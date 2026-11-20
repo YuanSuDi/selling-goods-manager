@@ -216,18 +216,10 @@ export const openImgDir = (dir) => {
   ipc.send('open_dir', dir)
 }
 
-export const selledItem = (product_no) => {
-  let data = { product_no: product_no, sku: 0, selled_num: 0 }
-  for (let i = 0; i < dataSource.value.length; i++) {
-    if (dataSource.value[i].product_no === product_no) {
-      dataSource.value[i].sku = dataSource.value[i].sku - 1
-      dataSource.value[i].selled_num = dataSource.value[i].selled_num + 1
-      data.sku = dataSource.value[i].sku
-      data.selled_num = dataSource.value[i].selled_num
-      break
-    }
-  }
-  ipc.send('selledItem', data)
+// v0.2.0: 状態を指定して販売する。在庫計算はメインプロセス側が
+// 状態別在庫に対して行うため、ここでは楽観更新をしない。
+export const selledItem = (product_no, condition_id) => {
+  ipc.send('selledItem', { product_no, condition_id: condition_id || null })
 }
 
 //商品情报提交（手動追加）
@@ -432,4 +424,88 @@ ipc.on('sale_reported', (e, sale) => {
 export const selectMainImage = () => ipc.send('select_main_image')
 ipc.on('main_image_selected', (e, filePath) => {
   if (filePath) editInfoByMainImg.value = filePath
+})
+
+// ---- v0.2.0: 状態（コンディション）・出品レコード・ノード ----
+// メインプロセスが正本を持ち、inventory_meta で丸ごと配信する。
+export const conditions = ref([])
+export const listings = ref([])
+export const nodes = ref([])
+ipc.on('inventory_meta', (e, meta) => {
+  if (!meta) return
+  conditions.value = Array.isArray(meta.conditions) ? meta.conditions : []
+  listings.value = Array.isArray(meta.listings) ? meta.listings : []
+  nodes.value = Array.isArray(meta.nodes) ? meta.nodes : []
+})
+ipc.send('get_inventory_meta')
+
+export const defaultCondition = computed(
+  () => conditions.value.find((c) => c.is_default) || conditions.value[0] || null
+)
+export const conditionName = (id) => {
+  const c = conditions.value.find((x) => x._id === id)
+  return c ? c.name : '不明な状態'
+}
+export const nodeLabel = (nodeId) => {
+  if (!nodeId) return '未割当'
+  const n = nodes.value.find((x) => x._id === nodeId)
+  if (!n) return '不明なノード'
+  return n.name || ('無名（' + String(nodeId).slice(0, 6) + '）')
+}
+export const recordsFor = (productNo) =>
+  listings.value.filter((r) => r.product_no === productNo)
+export const recordsForCondition = (productNo, conditionId) =>
+  listings.value.filter((r) => r.product_no === productNo && r.condition_id === conditionId)
+export const conditionStock = (product, conditionId) =>
+  product && product.condition_stock ? Number(product.condition_stock[conditionId] || 0) : 0
+export const conditionSold = (product, conditionId) =>
+  product && product.condition_sold ? Number(product.condition_sold[conditionId] || 0) : 0
+export const stockedConditions = (product) => {
+  if (!product || !product.condition_stock) return []
+  return Object.keys(product.condition_stock)
+    .filter((id) => Number(product.condition_stock[id] || 0) > 0)
+    .map((id) => ({ id, name: conditionName(id), count: Number(product.condition_stock[id]) }))
+}
+export const platformName = (p) => (p === 'yahoo' ? 'ヤフオク' : 'メルカリ')
+
+export const saveCondition = (data) => ipc.send('condition_save', data)
+export const deleteConditionById = (id) => ipc.send('condition_delete', { id })
+export const saveListing = (data) => ipc.send('listing_save', data)
+export const deleteListingById = (id) => ipc.send('listing_delete', { id })
+export const relistListing = (id) => ipc.send('listing_relist', { id })
+export const claimListing = (id) => ipc.send('listing_claim', { id })
+export const fixListingNode = (id, nodeId) => ipc.send('listing_fix_node', { id, node_id: nodeId })
+export const renameNode = (nodeId, name) => ipc.send('node_rename', { nodeId, name })
+export const deleteNodeById = (nodeId) => ipc.send('node_delete', { nodeId })
+
+const handleMetaResult = (result, okText) => {
+  if (result && result.ok) {
+    if (okText) {
+      successMsg.value = okText
+      successFlg.value = true
+    }
+  } else {
+    alertMsg.value = (result && result.error) || '操作に失敗しました。'
+    alertDisFlg.value = true
+  }
+}
+ipc.on('condition_result', (e, result) => handleMetaResult(result, '状態を更新しました。'))
+ipc.on('listing_result', (e, result) =>
+  handleMetaResult(
+    result,
+    result && result.claimed
+      ? '所有権の確認タスクを作成しました。対象ブラウザが次回ポーリングで確認します。'
+      : null
+  )
+)
+ipc.on('node_result', (e, result) => handleMetaResult(result, 'ノードを更新しました。'))
+ipc.on('node_mismatch', (e, info) => {
+  if (!info) return
+  alertMsg.value = `売却報告のブラウザとレコードの割当が一致しません（${info.product_no} / ${platformName(info.platform)}）。参照詳細でノード割当を確認してください。`
+  alertDisFlg.value = true
+})
+ipc.on('manual_sale_multi_record', (e, info) => {
+  if (!info) return
+  alertMsg.value = `${info.product_no}：その状態に自動補充レコードが複数あります。参照詳細から対象レコードの「補充出品」を押してください。`
+  alertDisFlg.value = true
 })

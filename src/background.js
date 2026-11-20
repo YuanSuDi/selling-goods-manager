@@ -26,6 +26,7 @@ import puppeteer from 'puppeteer-core';
 import crypto from 'crypto';
 import Datastore from 'nedb';
 import { createManagerServer } from './manager-server';
+import { createInventoryV2, conditionStockTotal, parseListingId } from './inventory-v2';
 import { productImagePathFromRequest } from './utils/product-image'
 const { prepareUserDataDirectory } = require('./utils/user-data')
 
@@ -70,6 +71,35 @@ function reportImageWorkflowError(sender, operation, error) {
 // タスクは tasks.db にも保存し、再起動時に pending 分を復元する。
 let managerServer = null
 let managerInfo = { port: 17341, token: '', running: false }
+
+// ---- v0.2.0: 状態・出品レコード・ノードのデータ層 -------------------------
+let inventory = null
+let conditionsDb = null
+let listingsDb = null
+let nodesDb = null
+let defaultConditionId = null
+// サーバの可視判定用に、ノード名をメモリにも持つ（DB が正）。
+const nodeInfoCache = new Map()
+
+function dbFindOne(dbInst, query) {
+  return new Promise((resolve, reject) => {
+    dbInst.findOne(query, (err, doc) => (err ? reject(err) : resolve(doc)))
+  })
+}
+function dbUpdate(dbInst, query, upd) {
+  return new Promise((resolve, reject) => {
+    dbInst.update(query, upd, {}, (err, n) => (err ? reject(err) : resolve(n)))
+  })
+}
+
+// 商品の状態別在庫を書き換え、sku（合計）も同期する。
+async function setConditionStock(product, conditionId, nextStock) {
+  const stockMap = Object.assign({}, product.condition_stock || {})
+  stockMap[conditionId] = Math.max(0, Number(nextStock || 0))
+  const total = Object.values(stockMap).reduce((a, b) => a + Math.max(0, Number(b || 0)), 0)
+  await dbUpdate(db, { product_no: product.product_no }, { $set: { condition_stock: stockMap, sku: total } })
+  return total
+}
 
 // Mercari の参照商品 URL を正規化する。完全な URL でも、m から始まる
 // 商品 ID だけでも受け付ける。解釈できなければ null。
@@ -137,13 +167,62 @@ function hasActiveRelistTask(product_no, itemUrl, platform) {
   return false
 }
 
+// 出品レコード単位で「実行待ち・実行中」の再出品タスクがあるか。
+function hasActiveTaskForRecord(record) {
+  if (!managerServer || !record) return false
+  for (const t of managerServer.tasks.values()) {
+    if (
+      t.type === 'relist' &&
+      (t.status === 'pending' || t.status === 'running') &&
+      t.listing_id === record._id
+    ) {
+      return true
+    }
+  }
+  return false
+}
+
+// 出品レコードから再出品タスクを作る（v0.2.0 の正規ルート）。
+// タスクにはレコード ID と担当ノードを引き継ぐ。
+function createRelistTaskForRecord(record, autoSubmit, trigger) {
+  if (!managerServer) throw new Error('連携サーバが起動していません')
+  if (!record || !record.listing_url) throw new Error('参照商品のURLが未設定です')
+  if (hasActiveTaskForRecord(record)) {
+    throw new Error('このレコードの出品タスクが既に実行待ちです')
+  }
+  if (hasActiveRelistTask(record.product_no, record.listing_url, record.platform)) {
+    throw new Error('同じ商品番号または商品IDの出品タスクが既に実行待ちです')
+  }
+  const task = managerServer.addTask({
+    product_no: record.product_no,
+    platform: record.platform,
+    type: 'relist',
+    itemUrl: record.listing_url,
+    autoSubmit: !!autoSubmit,
+    trigger: trigger || 'manual',
+    condition_id: record.condition_id,
+    listing_id: record._id,
+    node_id: record.node_id || '',
+  })
+  sendTaskList()
+  return task
+}
+
 // 参照商品をブラウザでコピーして再出品するタスクを作る。
-function createRelistTask(product, autoSubmit, trigger, platform) {
+// v0.2.0: 対応する出品レコードがあればレコード経由で作る。
+async function createRelistTask(product, autoSubmit, trigger, platform) {
   if (!managerServer) throw new Error('連携サーバが起動していません')
   const plat = platform === 'yahoo' ? 'yahoo' : 'mercari'
   const bind = platformBinding(plat)
   const itemUrl = bind.normalize(product[bind.refField])
   if (!itemUrl) throw new Error('参照商品のURLが未設定です')
+  if (inventory) {
+    const lid = parseListingId(plat, itemUrl)
+    const record = lid ? await inventory.findRecordByListingId(plat, lid) : null
+    if (record && record.product_no === product.product_no) {
+      return createRelistTaskForRecord(record, autoSubmit, trigger)
+    }
+  }
   if (hasActiveRelistTask(product.product_no, itemUrl, plat)) {
     throw new Error('同じ商品番号または' + bind.label + '商品IDの出品タスクが既に実行待ちです')
   }
@@ -177,6 +256,82 @@ function sendTaskList() {
   window.webContents.send('tasks_list', list)
 }
 
+// レンダラーへ状態・レコード・ノードの一覧を送る（v0.2.0 UI 用）。
+async function sendInventoryMeta() {
+  if (!inventory || !window || window.isDestroyed()) return
+  try {
+    const [conditions, listings, nodes] = await Promise.all([
+      inventory.listConditions(),
+      inventory.listListings(),
+      inventory.listNodes(),
+    ])
+    window.webContents.send('inventory_meta', { conditions, listings, nodes })
+  } catch (e) {
+    console.error('[manager] failed to send inventory meta', e)
+  }
+}
+
+// 従来のバインドモーダル（プラットフォーム別）からの保存を、レコード
+// 方式へ読み替える。対象は指定状態（既定は既定状態）の先頭レコード。
+// 既定状態のレコードは旧フィールドへも二重書きする。
+async function saveBindingFromIpc(platform, data) {
+  const bind = platformBinding(platform)
+  const productNo = String((data && data.product_no) || '').trim()
+  const rawItemUrl = String((data && data.itemUrl) || '').trim()
+  const itemUrl = rawItemUrl ? bind.normalize(rawItemUrl) : null
+  const autoRestock = !!(data && data.auto_restock)
+  if (!productNo) return { ok: false, error: '商品管理番号が指定されていません。' }
+  if ((rawItemUrl && !itemUrl) || (autoRestock && !itemUrl)) {
+    return {
+      ok: false,
+      error:
+        platform === 'yahoo'
+          ? '有効な Yahoo!オークション商品 URL またはオークション ID を入力してください。'
+          : '有効な Mercari 商品 URL または商品 ID を入力してください。',
+    }
+  }
+  if (!inventory || !defaultConditionId) return { ok: false, error: 'データ層が初期化されていません。' }
+  const product = await dbFindOne(db, { product_no: productNo })
+  if (!product) return { ok: false, error: '商品が見つかりません。' }
+  const condId = (data && data.condition_id) || defaultConditionId
+  const records = (await inventory.listListings(productNo)).filter(
+    (r) => r.platform === platform && r.condition_id === condId
+  )
+  if (!itemUrl) {
+    if (records.length > 1) {
+      return { ok: false, error: 'この状態には複数のレコードがあります。参照詳細から削除してください。' }
+    }
+    if (records.length === 1) await inventory.deleteListing(records[0]._id)
+    if (condId === defaultConditionId) {
+      await dbUpdate(db, { product_no: productNo }, { $set: { [bind.refField]: null, [bind.autoField]: false } })
+    }
+    return { ok: true, itemUrl: null, autoRestock: false }
+  }
+  const saved = records.length
+    ? await inventory.saveListing({
+        id: records[0]._id,
+        product_no: productNo,
+        condition_id: condId,
+        platform,
+        itemUrl,
+        auto_restock: autoRestock,
+        node_id: data.node_id,
+      })
+    : await inventory.saveListing({
+        product_no: productNo,
+        condition_id: condId,
+        platform,
+        itemUrl,
+        auto_restock: autoRestock,
+        node_id: data.node_id,
+      })
+  if (!saved.ok) return { ok: false, error: saved.error }
+  if (condId === defaultConditionId) {
+    await dbUpdate(db, { product_no: productNo }, { $set: { [bind.refField]: itemUrl, [bind.autoField]: autoRestock } })
+  }
+  return { ok: true, itemUrl, autoRestock }
+}
+
 function startManagerServer() {
   if (managerServer) return
   const cfgPath = path.join(userDataDir, 'manager.json')
@@ -195,10 +350,90 @@ function startManagerServer() {
   const persistTask = (task) => {
     tasksDb.update({ id: task.id }, task, { upsert: true }, () => {})
   }
+  // レコード紐付きタスクの結果をレコードへ反映する（v0.2.0）。
+  // 成功時は実行ノードをレコードの担当として記録する（出生バインド）。
+  // 既定状態のレコードは旧フィールドへも二重書きし、旧版へ戻しても
+  // 参照が壊れないようにする。
+  const applyTaskResultToRecord = async (task, record) => {
+    const bind = platformBinding(record.platform)
+    const isDefaultRecord = record.condition_id === defaultConditionId
+    const executedBy = (task.result && task.result.executedBy) || null
+    const bornNode = record.node_id || executedBy || ''
+    if (task.result && task.result.ok) {
+      if (record.platform === 'yahoo') {
+        await inventory.updateListing(record._id, { error: null, status: 'active', node_id: bornNode })
+        if (isDefaultRecord) {
+          const listingUrl = normalizeYahooUrl(task.result.listingUrl) || record.listing_url
+          db.update(
+            { product_no: record.product_no },
+            { $set: { yahoo_ref: listingUrl, yahoo_list_error: null } },
+            () => refreshRenderer()
+          )
+        } else refreshRenderer()
+        return
+      }
+      const listingUrl = normalizeMercariUrl(task.result.listingUrl)
+      const sourceUrl = normalizeMercariUrl(task.itemUrl)
+      if (!listingUrl || listingUrl === sourceUrl) {
+        const detail = task.result.message &&
+          !String(task.result.message).includes('参照 URL は更新されていません')
+          ? ' ' + task.result.message
+          : ''
+        const msg = '出品結果の URL が無効または参照元と同一のため、参照 URL は更新されていません。' + detail
+        await inventory.updateListing(record._id, { error: msg, status: 'error' })
+        if (isDefaultRecord) {
+          db.update(
+            { product_no: record.product_no },
+            { $set: { list_error: msg } },
+            () => refreshRenderer()
+          )
+        } else refreshRenderer()
+        return
+      }
+      await inventory.updateListing(record._id, {
+        listing_id: parseListingId('mercari', listingUrl),
+        listing_url: listingUrl,
+        error: null,
+        status: 'active',
+        node_id: bornNode,
+      })
+      if (isDefaultRecord) {
+        db.update(
+          { product_no: record.product_no },
+          { $set: { mercari_ref: listingUrl, list_error: null } },
+          () => refreshRenderer()
+        )
+      } else refreshRenderer()
+    } else {
+      const msg = (task.result && task.result.message) || '出品に失敗しました'
+      await inventory.updateListing(record._id, { error: msg, status: 'error' })
+      if (isDefaultRecord) {
+        db.update(
+          { product_no: record.product_no },
+          { $set: { [bind.errorField]: msg } },
+          () => refreshRenderer()
+        )
+      } else refreshRenderer()
+    }
+  }
+
   // 再出品タスクの結果を受けたら、商品の参照 URL を新しい出品 URL で
   // 上書きする（成功時）。失敗時はエラー内容を商品に残し、自動では
   // 再試行しない（次は手動で出品し直す）。
-  const handleTaskResult = (task) => {
+  // v0.2.0: レコード紐付きタスクはレコードへ、それ以外は従来処理へ。
+  const handleTaskResult = async (task) => {
+    if (inventory && task && task.type === 'relist' && task.listing_id) {
+      const record = await inventory.getListing(task.listing_id)
+      if (record) {
+        persistTask(task)
+        sendTaskList()
+        await applyTaskResultToRecord(task, record)
+        return
+      }
+    }
+    handleTaskResultLegacy(task)
+  }
+  const handleTaskResultLegacy = (task) => {
     persistTask(task)
     sendTaskList()
     if (!task || task.type !== 'relist' || !task.product_no) return
@@ -256,7 +491,151 @@ function startManagerServer() {
       )
     }
   }
+  // v0.2.0 の売却処理: 出品レコードを商品 ID で引き当て、そのレコードが
+  // 属する状態の在庫を引く。報告ノードとレコードの担当が食い違う場合は
+  // 自動で書き換えず、レンダラへ較正提案（node_mismatch）を送る。
   const handleSaleReported = async (sale) => {
+    if (!inventory) return handleSaleReportedLegacy(sale)
+    const itemId = String(sale.itemId || '')
+    if (!itemId) return { ok: false, matched: false }
+    const platform = sale.platform === 'yahoo' ? 'yahoo' : 'mercari'
+    const bind = platformBinding(platform)
+    let record = await inventory.findRecordByListingId(platform, itemId)
+    let product = record ? await dbFindOne(db, { product_no: record.product_no }) : null
+    if (!record || !product) {
+      // 保険: 移行漏れ（参照だけあってレコードがない）の場合は、その場で
+      // レコードを作ってから処理する。
+      const escapedItemId = itemId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      product = await dbFindOne(db, {
+        [bind.refField]: new RegExp(
+          '(?:^|/)' + bind.refSegment + escapedItemId + '(?:[/?#]|$)|^' + escapedItemId + '$',
+          'i'
+        ),
+      })
+      if (!product) return { ok: true, matched: false, itemId }
+      const saved = await inventory.saveListing({
+        product_no: product.product_no,
+        platform,
+        itemUrl: bind.normalize(product[bind.refField]),
+        auto_restock: !!product[bind.autoField],
+      })
+      if (!saved.ok) return { ok: true, matched: false, itemId }
+      record = saved.listing
+      // 移行時と同じく、処理済み ID とエラーも引き継ぐ。
+      await inventory.updateListing(record._id, {
+        last_processed_sale_item_id: product[bind.dedupeField] || null,
+        error: product[bind.errorField] || null,
+        status: product[bind.errorField] ? 'error' : 'active',
+      })
+      record = await inventory.getListing(record._id)
+    }
+
+    if (record.last_processed_sale_item_id === itemId) {
+      return { ok: true, matched: true, duplicate: true, itemId, product_no: product.product_no }
+    }
+
+    // レコード側の原子的ガード（スキャン多重報告・競合対策）。
+    const newSoldCount = Number(record.sold_count || 0) + 1
+    const guard = await dbUpdate(
+      listingsDb,
+      { _id: record._id, last_processed_sale_item_id: { $ne: itemId } },
+      {
+        $set: {
+          last_processed_sale_item_id: itemId,
+          sold_count: newSoldCount,
+          error: null,
+          status: 'active',
+          updatedAt: new Date().toISOString(),
+        },
+      }
+    )
+    if (!guard) {
+      return { ok: true, matched: true, duplicate: true, itemId, product_no: product.product_no }
+    }
+
+    const condId = record.condition_id
+    const stockMap = Object.assign({}, product.condition_stock || {})
+    stockMap[condId] = Math.max(0, Number(stockMap[condId] || 0) - 1)
+    const newCondStock = stockMap[condId]
+    const newSku = Object.values(stockMap).reduce((a, b) => a + Math.max(0, Number(b || 0)), 0)
+    const soldMap = Object.assign({}, product.condition_sold || {})
+    soldMap[condId] = Number(soldMap[condId] || 0) + 1
+    const newSoldNum = Number(product.selled_num || 0) + 1
+    const $set = {
+      condition_stock: stockMap,
+      condition_sold: soldMap,
+      sku: newSku,
+      selled_num: newSoldNum,
+    }
+    if (condId === defaultConditionId) {
+      $set[bind.errorField] = null
+      $set[bind.dedupeField] = itemId
+    }
+    await dbUpdate(db, { product_no: product.product_no }, { $set })
+
+    // ノード較正: 未割当なら報告ノードを担当として採用する（スキャンは
+    // 自分のアカウントしか見えないため、報告者＝所有者の証明になる）。
+    // 割当済みと食い違う場合は書き換えず、提案だけ送る。
+    const reporter = sale.nodeId || null
+    const updatedRecord = Object.assign({}, record, {
+      sold_count: newSoldCount,
+      last_processed_sale_item_id: itemId,
+    })
+    if (reporter && !record.node_id) {
+      await inventory.updateListing(record._id, { node_id: reporter })
+      updatedRecord.node_id = reporter
+    } else if (reporter && record.node_id && reporter !== record.node_id) {
+      if (window && !window.isDestroyed()) {
+        window.webContents.send('node_mismatch', {
+          product_no: product.product_no,
+          platform,
+          listing_record_id: record._id,
+          listing_id: itemId,
+          record_node_id: record.node_id,
+          record_node_name: (nodeInfoCache.get(record.node_id) || {}).name || null,
+          reported_node_id: reporter,
+          reported_node_name: (nodeInfoCache.get(reporter) || {}).name || null,
+        })
+      }
+    }
+
+    const quotaOk = record.quota == null || newSoldCount < Number(record.quota)
+    if (newCondStock > 0 && record.auto_restock && quotaOk) {
+      try {
+        createRelistTaskForRecord(updatedRecord, true, platform === 'yahoo' ? 'yahoo-sold' : 'mercari-todo')
+      } catch (e) {
+        console.warn('[manager] sale restock skipped:', e && e.message)
+      }
+    }
+    refreshRenderer()
+    if (window && !window.isDestroyed()) {
+      window.webContents.send('sale_reported', {
+        ok: true,
+        platform,
+        itemId,
+        product_no: product.product_no,
+        condition_id: condId,
+        sku: newSku,
+        selled_num: newSoldNum,
+      })
+    }
+    return { ok: true, matched: true, product_no: product.product_no, sku: newSku, selled_num: newSoldNum }
+  }
+
+  // 所有権の自己申告（認領）: スキャンしたノードが「この出品は自分の
+  // アカウントのものだ」と申告してきたら、未割当レコードの担当にする。
+  // 割当済みのレコードは奪わない。
+  const handleOwnershipClaim = async (claim) => {
+    if (!inventory || !claim || !claim.nodeId) return { ok: false, assigned: false }
+    const record = await inventory.findRecordByListingId(claim.platform, claim.listingId)
+    if (!record) return { ok: true, assigned: false }
+    if (record.node_id === claim.nodeId) return { ok: true, assigned: true, already: true }
+    if (record.node_id) return { ok: true, assigned: false, conflict: true }
+    await inventory.updateListing(record._id, { node_id: claim.nodeId })
+    return { ok: true, assigned: true, product_no: record.product_no }
+  }
+
+  const handleSaleReportedLegacy = async (sale) => {
     const itemId = String(sale.itemId || '')
     if (!itemId) return { ok: false, matched: false }
     const platform = sale.platform === 'yahoo' ? 'yahoo' : 'mercari'
@@ -338,6 +717,21 @@ function startManagerServer() {
     onTaskCreated: persistTask,
     onTaskResult: handleTaskResult,
     onSaleReported: handleSaleReported,
+    onTaskReleased: (task) => {
+      persistTask(task)
+      sendTaskList()
+    },
+    onNodeSeen: (nodeId) => {
+      if (!inventory) return
+      inventory
+        .touchNode(nodeId)
+        .then((n) => {
+          if (n) nodeInfoCache.set(nodeId, { id: nodeId, name: n.name || null })
+        })
+        .catch(() => {})
+    },
+    getNodeInfo: (nodeId) => nodeInfoCache.get(nodeId) || null,
+    onOwnershipClaim: handleOwnershipClaim,
   })
   managerServer.listen().then(() => {
     managerInfo.running = true
@@ -424,6 +818,10 @@ async function createWindow() {
       if(data1 != null) {
         e.sender.send('add_error_done', `商品管理番号：${data1.product_no}が存在してます。`)
       } else {
+          if (defaultConditionId && !data.condition_stock) {
+            data.condition_stock = { [defaultConditionId]: Math.max(0, Number(data.sku || 0)) }
+            data.condition_sold = { [defaultConditionId]: Math.max(0, Number(data.selled_num || 0)) }
+          }
           db.insert(data, function(err, doc) {
             e.sender.send('product_added', getAll())
           })
@@ -458,6 +856,10 @@ async function createWindow() {
               data.product_name = downData.title
               data.product_content = downData.content
               data.amazon_price = downData.price
+              if (defaultConditionId && !data.condition_stock) {
+                data.condition_stock = { [defaultConditionId]: Math.max(0, Number(data.sku || 0)) }
+                data.condition_sold = { [defaultConditionId]: Math.max(0, Number(data.selled_num || 0)) }
+              }
               db.insert(data, function(err) {
                 if (err) {
                   reportImageWorkflowError(e.sender, '快速追加', err)
@@ -555,41 +957,96 @@ async function createWindow() {
     }
   })
 
-  //商品入库
-  ipcMain.on('addProductCount', (e, data) => {
-    db.update({product_no: data.product_no}, {
-      $set: {
-          sku: data.sku,
-      },
-    })
+  //商品入库（v0.2.0: 状態別の在庫を絶対値で設定し、合計を sku に同期）
+  ipcMain.on('addProductCount', async (e, data) => {
+    try {
+      const product = await dbFindOne(db, { product_no: data.product_no })
+      if (!product) return
+      const condId = data.condition_id || defaultConditionId
+      if (!condId) return
+      await setConditionStock(product, condId, data.sku)
+      refreshRenderer()
+    } catch (err) {
+      console.error('[manager] addProductCount failed', err)
+    }
   })
 
-    //商品售出
-  ipcMain.on('selledItem', (e, data) => {
-    db.update({product_no: data.product_no}, {
-      $set: {
-          sku: data.sku,
-          selled_num:data.selled_num
-      },
-    }, () => {
-      // 自動補充: 参照 URL があり自動補充 ON で、在庫がまだ残っている
-      // 商品は、売れたタイミングで次の再出品タスクを自動作成する。
-      if (!managerServer) return
-      db.findOne({product_no: data.product_no}, (e2, product) => {
-        if (!product) return
-        if (!product.auto_restock || !product.mercari_ref) return
-        if (!(data.sku > 0)) return
+    //商品售出（v0.2.0: 状態を指定して、その状態の在庫を1つ引く。
+    // 状態の解決: 明示指定 → 在庫がある状態が1つだけならそれ → 曖昧ならエラー）
+  ipcMain.on('selledItem', async (e, data) => {
+    try {
+      const product = await dbFindOne(db, { product_no: data.product_no })
+      if (!product) return
+      const stockMap = product.condition_stock || {}
+      let condId = data.condition_id || null
+      if (!condId) {
+        const stocked = Object.keys(stockMap).filter((k) => Number(stockMap[k] || 0) > 0)
+        if (stocked.length === 1) condId = stocked[0]
+        else if (defaultConditionId && Number(stockMap[defaultConditionId] || 0) > 0 && stocked.length === 0) condId = defaultConditionId
+      }
+      if (!condId) {
+        e.sender.send('add_error_done', '売れた状態を選んでください。')
+        refreshRenderer()
+        return
+      }
+      const cur = Number(stockMap[condId] || 0)
+      if (cur <= 0) {
+        e.sender.send('add_error_done', 'その状態の在庫がありません。')
+        refreshRenderer()
+        return
+      }
+      const newCondStock = cur - 1
+      const newTotal = await setConditionStock(product, condId, newCondStock)
+      const soldMap = Object.assign({}, product.condition_sold || {})
+      soldMap[condId] = Number(soldMap[condId] || 0) + 1
+      const newSoldNum = Number(product.selled_num || 0) + 1
+      await dbUpdate(db, { product_no: product.product_no }, { $set: { condition_sold: soldMap, selled_num: newSoldNum } })
+      refreshRenderer()
+      // 自動補充: その状態の Mercari レコードで自動補充 ON のものが
+      // ちょうど1件なら、従来どおり自動で再出品タスクを作る。
+      if (!managerServer || !inventory) return
+      if (!(newCondStock > 0)) return
+      const records = (await inventory.listListings(product.product_no)).filter(
+        (r) => r.platform === 'mercari' && r.condition_id === condId && r.auto_restock
+      )
+      if (records.length === 1) {
+        const record = records[0]
+        const newRecordSold = Number(record.sold_count || 0) + 1
+        await inventory.updateListing(record._id, {
+          sold_count: newRecordSold,
+          error: null,
+          status: 'active',
+        })
+        if (record.quota != null && newRecordSold >= Number(record.quota)) return
         try {
-          const task = createRelistTask(product, true, 'manual-sale')
-          db.update({product_no: data.product_no}, { $set: { list_error: null } })
+          const task = createRelistTaskForRecord(record, true, 'manual-sale')
           if (window && !window.isDestroyed()) {
             window.webContents.send('list_task_created', { ok: true, task, auto: true })
           }
         } catch (err) {
           console.warn('[manager] auto restock skipped:', err && err.message)
         }
-      })
-    })
+      } else if (records.length > 1) {
+        e.sender.send('manual_sale_multi_record', { product_no: product.product_no, condition_id: condId })
+      } else if (product.auto_restock && product.mercari_ref) {
+        // レコードがない旧データ向けフォールバック
+        try {
+          const task = await createRelistTask(
+            Object.assign({}, product, { sku: newTotal }),
+            true,
+            'manual-sale'
+          )
+          db.update({ product_no: product.product_no }, { $set: { list_error: null } })
+          if (window && !window.isDestroyed()) {
+            window.webContents.send('list_task_created', { ok: true, task, auto: true })
+          }
+        } catch (err) {
+          console.warn('[manager] auto restock skipped:', err && err.message)
+        }
+      }
+    } catch (err) {
+      console.error('[manager] selledItem failed', err)
+    }
   })
 
    //保存备注
@@ -621,88 +1078,161 @@ async function createWindow() {
     e.sender.send('manager_info', managerInfo)
   })
 
-  ipcMain.on('bind_mercari_item', (e, data) => {
-    const binding = data || {}
-    const productNo = String(binding.product_no || '').trim()
-    const rawItemUrl = String(binding.itemUrl || '').trim()
-    const itemUrl = rawItemUrl ? normalizeMercariUrl(rawItemUrl) : null
-    const autoRestock = !!binding.auto_restock
-    if (!productNo) {
-      e.sender.send('mercari_binding_saved', { ok: false, error: '商品管理番号が指定されていません。' })
-      return
-    }
-    if ((rawItemUrl && !itemUrl) || (autoRestock && !itemUrl)) {
-      e.sender.send('mercari_binding_saved', {
-        ok: false,
-        error: '有効な Mercari 商品 URL または商品 ID を入力してください。',
-      })
-      return
-    }
-    db.findOne({ product_no: productNo }, (findErr, product) => {
-      if (findErr || !product) {
-        if (findErr) console.error('[manager] failed to find product for Mercari binding:', findErr)
-        e.sender.send('mercari_binding_saved', {
-          ok: false,
-          error: findErr ? '商品情報の読み込みに失敗しました。' : '商品が見つかりません。',
-        })
-        return
-      }
-      const $set = { mercari_ref: itemUrl, auto_restock: autoRestock }
-      db.update({ product_no: product.product_no }, { $set }, (updateErr) => {
-        if (updateErr) {
-          console.error('[manager] failed to save Mercari binding:', updateErr)
-          e.sender.send('mercari_binding_saved', {
-            ok: false,
-            error: 'Mercari 绑定保存失败。',
-          })
-          return
-        }
-        refreshRenderer()
-        e.sender.send('mercari_binding_saved', { ok: true, itemUrl, autoRestock })
-      })
-    })
+  ipcMain.on('bind_mercari_item', async (e, data) => {
+    const result = await saveBindingFromIpc('mercari', data || {})
+    if (result.ok) refreshRenderer()
+    e.sender.send('mercari_binding_saved', result)
+    sendInventoryMeta()
   })
 
-  ipcMain.on('bind_yahoo_item', (e, data) => {
-    const binding = data || {}
-    const productNo = String(binding.product_no || '').trim()
-    const rawItemUrl = String(binding.itemUrl || '').trim()
-    const itemUrl = rawItemUrl ? normalizeYahooUrl(rawItemUrl) : null
-    const autoRestock = !!binding.auto_restock
-    if (!productNo) {
-      e.sender.send('yahoo_binding_saved', { ok: false, error: '商品管理番号が指定されていません。' })
-      return
-    }
-    if ((rawItemUrl && !itemUrl) || (autoRestock && !itemUrl)) {
-      e.sender.send('yahoo_binding_saved', {
-        ok: false,
-        error: '有効な Yahoo!オークション商品 URL またはオークション ID を入力してください。',
-      })
-      return
-    }
-    db.findOne({ product_no: productNo }, (findErr, product) => {
-      if (findErr || !product) {
-        if (findErr) console.error('[manager] failed to find product for Yahoo binding:', findErr)
-        e.sender.send('yahoo_binding_saved', {
-          ok: false,
-          error: findErr ? '商品情報の読み込みに失敗しました。' : '商品が見つかりません。',
+  ipcMain.on('bind_yahoo_item', async (e, data) => {
+    const result = await saveBindingFromIpc('yahoo', data || {})
+    if (result.ok) refreshRenderer()
+    e.sender.send('yahoo_binding_saved', result)
+    sendInventoryMeta()
+  })
+
+  // ---- v0.2.0: 状態・レコード・ノード管理 IPC ----
+  ipcMain.on('get_inventory_meta', () => {
+    sendInventoryMeta()
+  })
+
+  ipcMain.on('condition_save', async (e, data) => {
+    const result = inventory
+      ? await inventory.saveCondition(data || {})
+      : { ok: false, error: 'データ層が初期化されていません。' }
+    e.sender.send('condition_result', result)
+    if (result.ok) sendInventoryMeta()
+  })
+
+  ipcMain.on('condition_delete', async (e, data) => {
+    const result = inventory
+      ? await inventory.deleteCondition((data || {}).id)
+      : { ok: false, error: 'データ層が初期化されていません。' }
+    e.sender.send('condition_result', result)
+    if (result.ok) sendInventoryMeta()
+  })
+
+  ipcMain.on('listing_save', async (e, data) => {
+    const result = inventory
+      ? await inventory.saveListing(data || {})
+      : { ok: false, error: 'データ層が初期化されていません。' }
+    if (result.ok && result.listing) {
+      // 既定状態のレコードは旧フィールドへ二重書きする。
+      const rec = result.listing
+      if (rec.condition_id === defaultConditionId) {
+        const bind = platformBinding(rec.platform)
+        await dbUpdate(db, { product_no: rec.product_no }, {
+          $set: { [bind.refField]: rec.listing_url, [bind.autoField]: !!rec.auto_restock },
         })
+        refreshRenderer()
+      }
+    }
+    e.sender.send('listing_result', result)
+    if (result.ok) sendInventoryMeta()
+  })
+
+  ipcMain.on('listing_delete', async (e, data) => {
+    const result = inventory
+      ? await inventory.deleteListing((data || {}).id)
+      : { ok: false, error: 'データ層が初期化されていません。' }
+    if (result.ok && result.listing && result.listing.condition_id === defaultConditionId) {
+      const bind = platformBinding(result.listing.platform)
+      const rest = (await inventory.listListings(result.listing.product_no)).filter(
+        (r) => r.platform === result.listing.platform && r.condition_id === defaultConditionId
+      )
+      if (!rest.length) {
+        await dbUpdate(db, { product_no: result.listing.product_no }, {
+          $set: { [bind.refField]: null, [bind.autoField]: false },
+        })
+        refreshRenderer()
+      }
+    }
+    e.sender.send('listing_result', result)
+    if (result.ok) sendInventoryMeta()
+  })
+
+  ipcMain.on('listing_relist', async (e, data) => {
+    try {
+      const record = inventory ? await inventory.getListing((data || {}).id) : null
+      if (!record) {
+        e.sender.send('listing_result', { ok: false, error: 'レコードが見つかりません。' })
         return
       }
-      const $set = { yahoo_ref: itemUrl, yahoo_auto_restock: autoRestock }
-      db.update({ product_no: product.product_no }, { $set }, (updateErr) => {
-        if (updateErr) {
-          console.error('[manager] failed to save Yahoo binding:', updateErr)
-          e.sender.send('yahoo_binding_saved', {
-            ok: false,
-            error: 'Yahoo 绑定保存失败。',
-          })
-          return
+      const product = await dbFindOne(db, { product_no: record.product_no })
+      const condStock = product && product.condition_stock
+        ? Number(product.condition_stock[record.condition_id] || 0)
+        : 0
+      if (!(condStock > 0)) {
+        e.sender.send('listing_result', { ok: false, error: 'その状態の在庫がありません。' })
+        return
+      }
+      const task = createRelistTaskForRecord(record, true, 'manual')
+      e.sender.send('list_task_created', { ok: true, task, auto: false })
+    } catch (err) {
+      e.sender.send('listing_result', { ok: false, error: String((err && err.message) || err) })
+    }
+  })
+
+  ipcMain.on('listing_claim', async (e, data) => {
+    try {
+      if (!managerServer) throw new Error('連携サーバが起動していません')
+      const record = inventory ? await inventory.getListing((data || {}).id) : null
+      if (!record) {
+        e.sender.send('listing_result', { ok: false, error: 'レコードが見つかりません。' })
+        return
+      }
+      for (const t of managerServer.tasks.values()) {
+        if (t.type === 'verify' && t.listing_id === record._id && t.status === 'pending') {
+          throw new Error('このレコードの所有権確認は既に実行待ちです')
         }
-        refreshRenderer()
-        e.sender.send('yahoo_binding_saved', { ok: true, itemUrl, autoRestock })
+      }
+      managerServer.addTask({
+        product_no: record.product_no,
+        platform: record.platform,
+        type: 'verify',
+        itemUrl: record.listing_url,
+        autoSubmit: false,
+        trigger: 'claim',
+        condition_id: record.condition_id,
+        listing_id: record._id,
+        node_id: '*',
       })
-    })
+      sendTaskList()
+      e.sender.send('listing_result', { ok: true, claimed: true })
+    } catch (err) {
+      e.sender.send('listing_result', { ok: false, error: String((err && err.message) || err) })
+    }
+  })
+
+  ipcMain.on('listing_fix_node', async (e, data) => {
+    const result = inventory
+      ? await inventory.updateListing((data || {}).id, { node_id: (data || {}).node_id || '' })
+          .then((rec) => ({ ok: !!rec, listing: rec }))
+          .catch((err) => ({ ok: false, error: String((err && err.message) || err) }))
+      : { ok: false, error: 'データ層が初期化されていません。' }
+    e.sender.send('listing_result', result)
+    if (result.ok) sendInventoryMeta()
+  })
+
+  ipcMain.on('node_rename', async (e, data) => {
+    const result = inventory
+      ? await inventory.renameNode((data || {}).nodeId, (data || {}).name)
+      : { ok: false, error: 'データ層が初期化されていません。' }
+    if (result.ok && result.node) {
+      nodeInfoCache.set(result.node._id, { id: result.node._id, name: result.node.name || null })
+    }
+    e.sender.send('node_result', result)
+    if (result.ok) sendInventoryMeta()
+  })
+
+  ipcMain.on('node_delete', async (e, data) => {
+    const result = inventory
+      ? await inventory.deleteNode((data || {}).nodeId)
+      : { ok: false, error: 'データ層が初期化されていません。' }
+    if (result.ok) nodeInfoCache.delete((data || {}).nodeId)
+    e.sender.send('node_result', result)
+    if (result.ok) sendInventoryMeta()
   })
 
   //現在のタスク一覧を返す
@@ -746,6 +1276,9 @@ async function createWindow() {
             { $set: { [bind.errorField]: null } },
             () => refreshRenderer()
           )
+          if (inventory && task.listing_id) {
+            inventory.updateListing(task.listing_id, { error: null, status: 'active' }).catch(() => {})
+          }
         }
       } else {
         console.log('[manager] task start refused (active relist exists):', task.id)
@@ -893,6 +1426,32 @@ app.whenReady().then(async () => {
     filename: path.join(userDataDir, 'tasks.db'),
     autoload: true,
   })
+  // v0.2.0: 状態・出品レコード・ノードの各 DB を用意し、サーバ起動前に
+  // 旧形式からの移行を済ませる（移行は冪等）。
+  conditionsDb = new Datastore({
+    filename: path.join(userDataDir, 'conditions.db'),
+    autoload: true,
+  })
+  listingsDb = new Datastore({
+    filename: path.join(userDataDir, 'listings.db'),
+    autoload: true,
+  })
+  nodesDb = new Datastore({
+    filename: path.join(userDataDir, 'nodes.db'),
+    autoload: true,
+  })
+  inventory = createInventoryV2({
+    productsDb: db,
+    conditionsDb,
+    listingsDb,
+    nodesDb,
+  })
+  const migrationStats = await inventory.migrate()
+  console.log('[manager] v0.2.0 migration:', JSON.stringify(migrationStats))
+  const defaultCond = await inventory.ensureDefaultCondition()
+  defaultConditionId = defaultCond._id
+  const knownNodes = await inventory.listNodes()
+  knownNodes.forEach((n) => nodeInfoCache.set(n._id, { id: n._id, name: n.name || null }))
 
   // Register before creating the window so renderer image requests cannot race
   // protocol setup.

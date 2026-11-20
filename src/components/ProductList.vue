@@ -4,9 +4,13 @@
   import { cloneDeep } from 'lodash-es';
   import {
     NO_IMAGE, dataSource, isLoading, lodingTip, currentItemNo,
-    urlClick, openImgDir, selledItem, editInfo, openMercariBinding, openYahooBinding,
+    urlClick, openImgDir, selledItem, editInfo,
     listSearch, noPrefixes, addNoPrefix, removeNoPrefix, clearCategoryFilter,
     refDetailFlag, refDetailProductNo, refDetailProduct, openRefDetail,
+    conditions, nodes, defaultCondition, conditionName, nodeLabel,
+    recordsFor, recordsForCondition, conditionStock, conditionSold, stockedConditions,
+    platformName, saveCondition, deleteConditionById, saveListing, deleteListingById,
+    relistListing, claimListing, fixListingNode,
   } from '../store';
   import { normalizeProductImageUrl } from '../utils/product-image'
 
@@ -182,28 +186,137 @@
     window.ipcRenderer.send('deleteItem', currentItemNo.value)
   }
 
-  //入库添加
+  //入库添加（v0.2.0: 状態を選んで、その状態の在庫を増やす）
   let addProductFlag = ref(false);
   let addProductCount = ref(0);
+  let addCondId = ref(null);
   const addProduct = product_no => {
     addProductFlag.value = true
     currentItemNo.value = product_no
+    const dc = defaultCondition.value
+    addCondId.value = dc ? dc._id : null
   };
   const addProductConfirmed = () => {
     addProductFlag.value = false
-    let sku = 0
-    for (let i = 0; i < dataSource.value.length; i++) {
-      if (dataSource.value[i].product_no === currentItemNo.value) {
-        dataSource.value[i].sku = dataSource.value[i].sku + addProductCount.value
-        sku = dataSource.value[i].sku
-        break;
-      }
-    }
-    let data = { product_no: currentItemNo.value, sku: sku }
+    const rec = dataSource.value.find((p) => p.product_no === currentItemNo.value)
+    const condId = addCondId.value || (defaultCondition.value && defaultCondition.value._id)
+    if (!rec || !condId) return
+    const cur = rec.condition_stock ? Number(rec.condition_stock[condId] || 0) : Number(rec.sku || 0)
+    let data = { product_no: currentItemNo.value, condition_id: condId, sku: cur + addProductCount.value }
     window.ipcRenderer.send('addProductCount', data)
     currentItemNo.value = ""
     addProductCount.value = 0
   }
+
+  // ---- v0.2.0: 状態別表示ヘルパー ----
+  const mapLines = (map) => {
+    if (!map) return []
+    return Object.keys(map)
+      .filter((id) => Number(map[id] || 0) > 0)
+      .map((id) => ({ id, name: conditionName(id), count: Number(map[id]) }))
+  };
+  const nodeOptions = computed(() => [
+    { value: '', label: '未割当（既定プール）' },
+    ...nodes.value.map((n) => ({ value: n._id, label: n.name || ('無名（' + String(n._id).slice(0, 6) + '）') })),
+  ]);
+
+  // ---- 1件販売（状態が複数あれば選択モーダル） ----
+  const salePickFlag = ref(false);
+  const salePickProductNo = ref('');
+  const salePickCondId = ref(null);
+  const salePickProduct = computed(
+    () => dataSource.value.find((p) => p.product_no === salePickProductNo.value) || null
+  );
+  const onSellClick = (record) => {
+    const stocked = stockedConditions(record)
+    if (stocked.length === 1) {
+      selledItem(record.product_no, stocked[0].id)
+    } else if (stocked.length > 1) {
+      salePickProductNo.value = record.product_no
+      salePickCondId.value = stocked[0].id
+      salePickFlag.value = true
+    }
+  };
+  const confirmSalePick = () => {
+    if (salePickCondId.value) selledItem(salePickProductNo.value, salePickCondId.value)
+    salePickFlag.value = false
+  };
+
+  // ---- 状態管理モーダル ----
+  const condMgrFlag = ref(false);
+  const condDrafts = reactive({});
+  const newCondName = ref('');
+  const openConditionManager = () => {
+    conditions.value.forEach((c) => { condDrafts[c._id] = c.name })
+    newCondName.value = ''
+    condMgrFlag.value = true
+  };
+  const saveCondRename = (c) => {
+    const name = String(condDrafts[c._id] || '').trim()
+    if (name && name !== c.name) saveCondition({ id: c._id, name })
+  };
+  const addCond = () => {
+    const name = newCondName.value.trim()
+    if (!name) return
+    saveCondition({ name })
+    newCondName.value = ''
+  };
+  const removeCond = (c) => {
+    deleteConditionById(c._id)
+  };
+
+  // ---- 出品レコード編集モーダル ----
+  const listingEditFlag = ref(false);
+  const listingEdit = reactive({
+    id: null, product_no: '', condition_id: null, platform: 'mercari',
+    listing: '', node_id: '', auto_restock: true, quota: null,
+  });
+  const openListingEdit = (record, conditionId) => {
+    if (record) {
+      listingEdit.id = record._id
+      listingEdit.product_no = record.product_no
+      listingEdit.condition_id = record.condition_id
+      listingEdit.platform = record.platform
+      listingEdit.listing = record.listing_url || record.listing_id || ''
+      listingEdit.node_id = record.node_id || ''
+      listingEdit.auto_restock = !!record.auto_restock
+      listingEdit.quota = record.quota != null ? record.quota : null
+    } else {
+      listingEdit.id = null
+      listingEdit.product_no = refDetailProductNo.value
+      listingEdit.condition_id = conditionId
+      listingEdit.platform = 'mercari'
+      listingEdit.listing = ''
+      listingEdit.node_id = ''
+      listingEdit.auto_restock = true
+      listingEdit.quota = null
+    }
+    listingEditFlag.value = true
+  };
+  const submitListingEdit = () => {
+    saveListing({
+      id: listingEdit.id || undefined,
+      product_no: listingEdit.product_no,
+      condition_id: listingEdit.condition_id,
+      platform: listingEdit.platform,
+      listing: listingEdit.listing,
+      node_id: listingEdit.node_id || '',
+      auto_restock: listingEdit.auto_restock,
+      quota: listingEdit.quota === '' ? null : listingEdit.quota,
+    })
+    listingEditFlag.value = false
+  };
+  const delListingFlag = ref(false);
+  const delListingTarget = ref(null);
+  const askDeleteListing = (record) => {
+    delListingTarget.value = record
+    delListingFlag.value = true
+  };
+  const confirmDeleteListing = () => {
+    if (delListingTarget.value) deleteListingById(delListingTarget.value._id)
+    delListingFlag.value = false
+    delListingTarget.value = null
+  };
 
   //编辑备注
   const editableData = reactive({});
@@ -242,6 +355,7 @@
       @clear="clearCategoryFilter"
     ></a-select>
     <a-button @click="openPrefixModal">種類管理</a-button>
+    <a-button @click="openConditionManager">状態管理</a-button>
     <a-input-search
       v-model:value="listSearch.searchNo"
       placeholder="番号を入力"
@@ -284,12 +398,23 @@
       </template>
       <template v-else-if="column.key === 'sku'">
         <a-tag v-if="record.sku == 0" color="red">SOLD OUT</a-tag>
-        <span v-else class="stock-num">{{ record.sku }}</span>
+        <template v-else>
+          <span class="stock-num">{{ record.sku }}</span>
+          <div v-if="mapLines(record.condition_stock).length > 1" class="stock-lines">
+            <div v-for="l in mapLines(record.condition_stock)" :key="l.id">{{ l.name }} {{ l.count }}</div>
+          </div>
+        </template>
+      </template>
+      <template v-else-if="column.key === 'selled_num'">
+        <span>{{ record.selled_num }}</span>
+        <div v-if="mapLines(record.condition_sold).length > 1" class="stock-lines">
+          <div v-for="l in mapLines(record.condition_sold)" :key="l.id">{{ l.name }} {{ l.count }}</div>
+        </div>
       </template>
       <template v-else-if="column.key === 'do'">
         <div class="ops">
           <div class="ops-row">
-            <a-button v-if="record.sku != 0" size="small" @click="selledItem(record.product_no)">1件販売</a-button>
+            <a-button v-if="record.sku != 0" size="small" @click="onSellClick(record)">1件販売</a-button>
             <a-button size="small" @click="addProduct(record.product_no)">入荷</a-button>
           </div>
           <div class="ops-row">
@@ -301,9 +426,12 @@
       </template>
       <template v-else-if="column.key === 'refs'">
         <div class="refs-cell" title="クリックで参照詳細" @click="openRefDetail(record.product_no)">
-          <template v-if="record.mercari_ref || record.yahoo_ref">
-            <a-tag v-if="record.mercari_ref" :color="record.list_error ? 'red' : (record.auto_restock ? 'green' : 'blue')">メルカリ{{ record.list_error ? ' エラー' : (record.auto_restock ? ' 自動' : '') }}</a-tag>
-            <a-tag v-if="record.yahoo_ref" :color="record.yahoo_list_error ? 'red' : (record.yahoo_auto_restock ? 'green' : 'blue')">ヤフオク{{ record.yahoo_list_error ? ' エラー' : (record.yahoo_auto_restock ? ' 自動' : '') }}</a-tag>
+          <template v-if="recordsFor(record.product_no).length">
+            <a-tag
+              v-for="r in recordsFor(record.product_no)"
+              :key="r._id"
+              :color="r.error ? 'red' : (r.auto_restock ? 'green' : 'blue')"
+            >{{ platformName(r.platform) }}{{ r.error ? ' エラー' : (r.auto_restock ? ' 自動' : '') }}{{ r.node_id ? ' ·' + nodeLabel(r.node_id) : '' }}</a-tag>
           </template>
           <span v-else class="ref-none">未設定</span>
         </div>
@@ -328,6 +456,13 @@
   </a-modal>
   <a-modal v-model:open="addProductFlag" title="商品入库" @ok="addProductConfirmed">
     <a-form layout="vertical">
+      <a-form-item label="状態">
+        <a-select
+          v-model:value="addCondId"
+          style="width: 100%"
+          :options="conditions.map((c) => ({ value: c._id, label: c.name + (c.is_default ? '（既定）' : '') }))"
+        />
+      </a-form-item>
       <a-form-item label="入荷数">
         <a-input-number v-model:value="addProductCount" style="width: 100%" />
       </a-form-item>
@@ -345,33 +480,106 @@
     <div v-if="prefixError" style="color: #ff4d4f; margin-top: 8px;">{{ prefixError }}</div>
     <p style="color: #999; margin-top: 12px;">※ タグの × で削除できます。削除した種類で絞り込み中だった場合は絞り込みが解除されます。追加・削除は自動で保存されます。</p>
   </a-modal>
-  <a-modal v-model:open="refDetailFlag" :title="'参照詳細（' + refDetailProductNo + '）'" :footer="null">
+  <a-modal v-model:open="refDetailFlag" :title="'参照詳細（' + refDetailProductNo + '）'" :footer="null" width="760px">
     <template v-if="refDetailProduct">
-      <div class="ref-detail-block">
+      <p style="color: #999; margin-top: 0;">状態ごとに在庫と出品レコード（プラットフォーム × ブラウザ）を管理します。</p>
+      <div v-for="cond in conditions" :key="cond._id" class="ref-detail-block">
         <div class="ref-detail-head">
-          <span class="ref-detail-name">メルカリ</span>
-          <a-button size="small" @click="refDetailFlag = false; openMercariBinding(refDetailProduct.product_no)">バインド変更</a-button>
+          <span class="ref-detail-name">
+            {{ cond.name }}
+            <a-tag v-if="cond.is_default" color="default">既定</a-tag>
+          </span>
+          <span class="ref-detail-stock">在庫 {{ conditionStock(refDetailProduct, cond._id) }} / 販売 {{ conditionSold(refDetailProduct, cond._id) }}</span>
+          <a-button size="small" @click="openListingEdit(null, cond._id)">レコード追加</a-button>
         </div>
-        <template v-if="refDetailProduct.mercari_ref">
-          <div class="ref-detail-line">参照：<a class="link" @click="urlClick(refDetailProduct.mercari_ref)">{{ refDetailProduct.mercari_ref }}</a></div>
-          <div class="ref-detail-line">自動補充：{{ refDetailProduct.auto_restock ? 'ON' : 'OFF' }}</div>
-          <div v-if="refDetailProduct.list_error" class="ref-detail-line" style="color: #ff4d4f;">エラー：{{ refDetailProduct.list_error }}</div>
-        </template>
-        <div v-else class="ref-none">未設定</div>
-      </div>
-      <div class="ref-detail-block">
-        <div class="ref-detail-head">
-          <span class="ref-detail-name">Yahoo!オークション</span>
-          <a-button size="small" @click="refDetailFlag = false; openYahooBinding(refDetailProduct.product_no)">バインド変更</a-button>
+        <div
+          v-for="r in recordsForCondition(refDetailProduct.product_no, cond._id)"
+          :key="r._id"
+          class="rec-row"
+        >
+          <div class="rec-main">
+            <a-tag :color="r.error ? 'red' : (r.auto_restock ? 'green' : 'blue')">{{ platformName(r.platform) }}</a-tag>
+            <a class="link" @click="urlClick(r.listing_url)">{{ r.listing_id }}</a>
+            <span class="rec-meta">ノード：{{ nodeLabel(r.node_id) }}</span>
+            <span class="rec-meta">自動補充：{{ r.auto_restock ? 'ON' : 'OFF' }}</span>
+            <span class="rec-meta">配額：{{ r.quota != null ? r.quota : '無制限' }}（販売 {{ r.sold_count || 0 }}）</span>
+          </div>
+          <div v-if="r.error" class="rec-error">エラー：{{ r.error }}</div>
+          <div class="rec-ops">
+            <a-button size="small" @click="openListingEdit(r)">編集</a-button>
+            <a-button
+              size="small"
+              :disabled="conditionStock(refDetailProduct, cond._id) <= 0"
+              @click="relistListing(r._id)"
+            >補充出品</a-button>
+            <a-button v-if="!r.node_id" size="small" @click="claimListing(r._id)">所有権を確認</a-button>
+            <a-select
+              size="small"
+              style="width: 170px"
+              :value="r.node_id || ''"
+              :options="nodeOptions"
+              @change="(v) => fixListingNode(r._id, v)"
+            />
+            <a-button size="small" danger @click="askDeleteListing(r)">削除</a-button>
+          </div>
         </div>
-        <template v-if="refDetailProduct.yahoo_ref">
-          <div class="ref-detail-line">参照：<a class="link" @click="urlClick(refDetailProduct.yahoo_ref)">{{ refDetailProduct.yahoo_ref }}</a></div>
-          <div class="ref-detail-line">自動補充：{{ refDetailProduct.yahoo_auto_restock ? 'ON' : 'OFF' }}</div>
-          <div v-if="refDetailProduct.yahoo_list_error" class="ref-detail-line" style="color: #ff4d4f;">エラー：{{ refDetailProduct.yahoo_list_error }}</div>
-        </template>
-        <div v-else class="ref-none">未設定</div>
+        <div v-if="!recordsForCondition(refDetailProduct.product_no, cond._id).length" class="ref-none">レコードなし</div>
       </div>
     </template>
+  </a-modal>
+
+  <a-modal v-model:open="salePickFlag" title="販売する状態を選択" @ok="confirmSalePick">
+    <a-radio-group v-if="salePickProduct" v-model:value="salePickCondId" style="display: flex; flex-direction: column; gap: 8px;">
+      <a-radio v-for="c in stockedConditions(salePickProduct)" :key="c.id" :value="c.id">
+        {{ c.name }}（在庫 {{ c.count }}）
+      </a-radio>
+    </a-radio-group>
+  </a-modal>
+
+  <a-modal v-model:open="condMgrFlag" title="状態管理" :footer="null">
+    <div v-for="c in conditions" :key="c._id" class="cond-row">
+      <a-input v-model:value="condDrafts[c._id]" style="flex: 1" />
+      <a-tag v-if="c.is_default" color="default">既定</a-tag>
+      <a-button size="small" @click="saveCondRename(c)">保存</a-button>
+      <a-button size="small" danger :disabled="c.is_default" @click="removeCond(c)">削除</a-button>
+    </div>
+    <div style="display: flex; gap: 8px; margin-top: 12px;">
+      <a-input v-model:value="newCondName" placeholder="新しい状態（例：九成新）" @pressEnter="addCond" />
+      <a-button type="primary" @click="addCond">追加</a-button>
+    </div>
+    <p style="color: #999; margin-top: 12px;">※ 名前の変更は表示だけに効きます。在庫やレコードがある状態、既定の状態は削除できません。</p>
+  </a-modal>
+
+  <a-modal
+    v-model:open="listingEditFlag"
+    :title="listingEdit.id ? 'レコード編集' : 'レコード追加'"
+    @ok="submitListingEdit"
+  >
+    <a-form layout="vertical">
+      <a-form-item label="プラットフォーム">
+        <a-select
+          v-model:value="listingEdit.platform"
+          :disabled="!!listingEdit.id"
+          :options="[{ value: 'mercari', label: 'メルカリ' }, { value: 'yahoo', label: 'ヤフオク' }]"
+        />
+      </a-form-item>
+      <a-form-item label="商品リンクまたはID">
+        <a-input v-model:value="listingEdit.listing" placeholder="例：https://jp.mercari.com/item/m12345678901 / w123456789" />
+      </a-form-item>
+      <a-form-item label="ノード（ブラウザ）">
+        <a-select v-model:value="listingEdit.node_id" :options="nodeOptions" />
+      </a-form-item>
+      <a-form-item label="自動補充">
+        <a-switch v-model:checked="listingEdit.auto_restock" />
+      </a-form-item>
+      <a-form-item label="配額（このレコードが売れる上限、空欄＝無制限）">
+        <a-input-number v-model:value="listingEdit.quota" style="width: 100%" :min="0" placeholder="無制限" />
+      </a-form-item>
+    </a-form>
+  </a-modal>
+
+  <a-modal v-model:open="delListingFlag" title="レコード削除確認" @ok="confirmDeleteListing">
+    <p>この出品レコードを削除してよろしいですか。（プラットフォーム側の出品は削除されません）</p>
   </a-modal>
 </template>
 
@@ -459,6 +667,50 @@
 .ref-detail-line {
   margin: 2px 0;
   word-break: break-all;
+}
+.stock-lines {
+  font-size: 11px;
+  color: #8a919c;
+  line-height: 1.5;
+}
+.ref-detail-stock {
+  color: #5f6672;
+  font-size: 12px;
+}
+.rec-row {
+  padding: 8px 10px;
+  margin: 6px 0;
+  border: 1px solid #eceef1;
+  border-radius: 8px;
+}
+.rec-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.rec-meta {
+  color: #5f6672;
+  font-size: 12px;
+}
+.rec-error {
+  color: #ff4d4f;
+  font-size: 12px;
+  margin-top: 4px;
+  word-break: break-all;
+}
+.rec-ops {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  align-items: center;
+  margin-top: 8px;
+}
+.cond-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
 }
 .editable-cell {
   position: relative;
