@@ -6,6 +6,7 @@
     NO_IMAGE, dataSource, isLoading, lodingTip, currentItemNo,
     urlClick, openImgDir, selledItem, editInfo, openMercariBinding, openYahooBinding,
     listSearch, noPrefixes, addNoPrefix, removeNoPrefix, clearCategoryFilter,
+    refDetailFlag, refDetailProductNo, refDetailProduct, openRefDetail,
   } from '../store';
   import { normalizeProductImageUrl } from '../utils/product-image'
 
@@ -63,62 +64,57 @@
     title: '商品タイトル',
     dataIndex: 'product_name',
     key: 'product_name',
-    width: 300,
+    width: 240,
       resizable: true,
   },
   {
     title: '商品詳細',
     dataIndex: 'product_content',
     key: 'product_content',
-    width: 300,
+    width: 200,
     resizable: true,
   },
   {
     title: 'Amazon値段',
     dataIndex: 'amazon_price',
     key: 'amazon_price',
+    width: 90,
   },
   {
     title: '在庫数',
     key: 'sku',
     dataIndex: 'sku',
+    width: 64,
   },
   {
     title: '販売数',
     dataIndex: 'selled_num',
     key: 'selled_num',
+    width: 64,
   },
   {
     title: '商品リンク',
     dataIndex: 'amazon_url',
     key: 'amazon_url',
+    width: 76,
   },
   {
-    title: 'メルカリ参照',
-    dataIndex: 'mercari_ref',
-    key: 'mercari_ref',
-    width: 140,
-    resizable: true,
-  },
-  {
-    title: 'ヤフオク参照',
-    dataIndex: 'yahoo_ref',
-    key: 'yahoo_ref',
-    width: 140,
-    resizable: true,
+    title: '参照',
+    key: 'refs',
+    width: 132,
   },
   {
     title: '備考',
     dataIndex: 'comment',
     key: 'comment',
-    width: 300,
+    width: 200,
   }
   ,
   {
     title: '操作',
     dataIndex: 'do',
     key: 'do',
-    width: 235,
+    width: 174,
   },
   ]
 
@@ -262,7 +258,7 @@
     />
   </div>
 
-  <a-table :dataSource="dataSource" :columns="columns" rowKey="product_no" :pagination="pagination" :scroll="{ x: 'max-content' }">
+  <a-table :dataSource="dataSource" :columns="columns" rowKey="product_no" :pagination="pagination" :scroll="{ x: 1440 }">
     <template #expandedRowRender="{ record }">
       <div class="expanded">
         <div class="expanded-name">{{ record.product_name }}</div>
@@ -293,8 +289,6 @@
       <template v-else-if="column.key === 'do'">
         <div class="ops">
           <div class="ops-row">
-            <a-button type="primary" size="small" @click="openMercariBinding(record.product_no)">自动出品绑定</a-button>
-            <a-button size="small" @click="openYahooBinding(record.product_no)">雅虎绑定</a-button>
             <a-button v-if="record.sku != 0" size="small" @click="selledItem(record.product_no)">一つ売り</a-button>
             <a-button size="small" @click="addProduct(record.product_no)">入荷</a-button>
           </div>
@@ -305,25 +299,14 @@
           </div>
         </div>
       </template>
-      <template v-else-if="column.key === 'mercari_ref'">
-        <div v-if="record.mercari_ref" class="ref-cell">
-          <a class="link" @click="urlClick(record.mercari_ref)">{{ record.mercari_ref.split('/').pop() }}</a>
-          <div class="ref-tags">
-            <a-tag v-if="record.list_error" color="red">出品エラー</a-tag>
-            <a-tag v-else-if="record.auto_restock" color="green">自動補充</a-tag>
-          </div>
+      <template v-else-if="column.key === 'refs'">
+        <div class="refs-cell" title="クリックで参照詳細" @click="openRefDetail(record.product_no)">
+          <template v-if="record.mercari_ref || record.yahoo_ref">
+            <a-tag v-if="record.mercari_ref" :color="record.list_error ? 'red' : (record.auto_restock ? 'green' : 'blue')">メルカリ{{ record.list_error ? ' エラー' : (record.auto_restock ? ' 自動' : '') }}</a-tag>
+            <a-tag v-if="record.yahoo_ref" :color="record.yahoo_list_error ? 'red' : (record.yahoo_auto_restock ? 'green' : 'blue')">ヤフオク{{ record.yahoo_list_error ? ' エラー' : (record.yahoo_auto_restock ? ' 自動' : '') }}</a-tag>
+          </template>
+          <span v-else class="ref-none">未設定</span>
         </div>
-        <span v-else class="ref-none">未設定</span>
-      </template>
-      <template v-else-if="column.key === 'yahoo_ref'">
-        <div v-if="record.yahoo_ref" class="ref-cell">
-          <a class="link" @click="urlClick(record.yahoo_ref)">{{ record.yahoo_ref.split('/').pop() }}</a>
-          <div class="ref-tags">
-            <a-tag v-if="record.yahoo_list_error" color="red">出品エラー</a-tag>
-            <a-tag v-else-if="record.yahoo_auto_restock" color="green">自動補充</a-tag>
-          </div>
-        </div>
-        <span v-else class="ref-none">未設定</span>
       </template>
       <template v-else-if="column.key === 'comment'">
         <div class="editable-cell">
@@ -361,6 +344,34 @@
     </div>
     <div v-if="prefixError" style="color: #ff4d4f; margin-top: 8px;">{{ prefixError }}</div>
     <p style="color: #999; margin-top: 12px;">※ タグの × で削除できます。削除した種類で絞り込み中だった場合は絞り込みが解除されます。追加・削除は自動で保存されます。</p>
+  </a-modal>
+  <a-modal v-model:open="refDetailFlag" :title="'参照詳細（' + refDetailProductNo + '）'" :footer="null">
+    <template v-if="refDetailProduct">
+      <div class="ref-detail-block">
+        <div class="ref-detail-head">
+          <span class="ref-detail-name">メルカリ</span>
+          <a-button size="small" @click="refDetailFlag = false; openMercariBinding(refDetailProduct.product_no)">バインド変更</a-button>
+        </div>
+        <template v-if="refDetailProduct.mercari_ref">
+          <div class="ref-detail-line">参照：<a class="link" @click="urlClick(refDetailProduct.mercari_ref)">{{ refDetailProduct.mercari_ref }}</a></div>
+          <div class="ref-detail-line">自動補充：{{ refDetailProduct.auto_restock ? 'ON' : 'OFF' }}</div>
+          <div v-if="refDetailProduct.list_error" class="ref-detail-line" style="color: #ff4d4f;">エラー：{{ refDetailProduct.list_error }}</div>
+        </template>
+        <div v-else class="ref-none">未設定</div>
+      </div>
+      <div class="ref-detail-block">
+        <div class="ref-detail-head">
+          <span class="ref-detail-name">Yahoo!オークション</span>
+          <a-button size="small" @click="refDetailFlag = false; openYahooBinding(refDetailProduct.product_no)">バインド変更</a-button>
+        </div>
+        <template v-if="refDetailProduct.yahoo_ref">
+          <div class="ref-detail-line">参照：<a class="link" @click="urlClick(refDetailProduct.yahoo_ref)">{{ refDetailProduct.yahoo_ref }}</a></div>
+          <div class="ref-detail-line">自動補充：{{ refDetailProduct.yahoo_auto_restock ? 'ON' : 'OFF' }}</div>
+          <div v-if="refDetailProduct.yahoo_list_error" class="ref-detail-line" style="color: #ff4d4f;">エラー：{{ refDetailProduct.yahoo_list_error }}</div>
+        </template>
+        <div v-else class="ref-none">未設定</div>
+      </div>
+    </template>
   </a-modal>
 </template>
 
@@ -421,6 +432,33 @@
 }
 .ref-none {
   color: #b6bcc6;
+}
+.refs-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  cursor: pointer;
+}
+.ref-detail-block {
+  padding: 10px 0;
+  border-bottom: 1px solid #f0f0f0;
+}
+.ref-detail-block:last-child {
+  border-bottom: none;
+}
+.ref-detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+.ref-detail-name {
+  font-weight: 600;
+}
+.ref-detail-line {
+  margin: 2px 0;
+  word-break: break-all;
 }
 .editable-cell {
   position: relative;

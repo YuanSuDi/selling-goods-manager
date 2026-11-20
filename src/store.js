@@ -359,6 +359,17 @@ export const saveYahooBinding = () => {
   })
 }
 
+// ---- 参照詳細モーダル（商品一覧の「参照」列から開く） ----
+export const refDetailFlag = ref(false)
+export const refDetailProductNo = ref('')
+export const refDetailProduct = computed(
+  () => dataSource.value.find((p) => p.product_no === refDetailProductNo.value) || null
+)
+export const openRefDetail = (product_no) => {
+  refDetailProductNo.value = product_no
+  refDetailFlag.value = true
+}
+
 // ---- 連携情報モーダル ----
 export const mgrInfoFlag = ref(false)
 export const mgrInfo = ref({})

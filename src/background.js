@@ -862,7 +862,22 @@ function setupAutoUpdater() {
   autoUpdater.checkForUpdates().catch(reportUpdaterError)
 }
 
+// 二重起動防止：ロックを取れなかった側は即終了する（DB とポート 17341 の
+// 二重使用を防ぐ）。二つ目が起動されたら既存ウィンドウを前面に出す。
+const gotSingleInstanceLock = app.requestSingleInstanceLock()
+if (!gotSingleInstanceLock) {
+  app.quit()
+}
+app.on('second-instance', () => {
+  if (window) {
+    if (window.isMinimized()) window.restore()
+    if (!window.isVisible()) window.show()
+    window.focus()
+  }
+})
+
 app.whenReady().then(async () => {
+  if (!gotSingleInstanceLock) return
   const preparedData = await prepareUserDataDirectory(
     app.getPath('userData'),
     findLegacyDataRoot()
