@@ -1,11 +1,13 @@
 <script setup>
-  import { taskModalFlag, taskList, requestTaskList } from '../store';
+  import { taskModalFlag, taskList, requestTaskList, nodeLabel, platformName } from '../store';
 
   const taskColumns = [
     { title: '商品番号', dataIndex: 'product_no', key: 'product_no', width: 110 },
     { title: '起動元', dataIndex: 'trigger', key: 'trigger', width: 100 },
     { title: '自動出品', dataIndex: 'autoSubmit', key: 'autoSubmit', width: 95 },
+    { title: 'サイト', key: 'platform', width: 110 },
     { title: '参照商品', key: 'itemUrl', width: 120 },
+    { title: 'ノード', key: 'node', width: 160 },
     { title: '状態', key: 'status', width: 90 },
     { title: '作成', key: 'createdAt', width: 150 },
     { title: '結果', key: 'result' },
@@ -25,9 +27,19 @@
     return isNaN(d.getTime()) ? '—' : d.toLocaleString('ja-JP');
   };
   const mercariIdOf = (url) => {
-    const m = String(url || '').match(/(m\d{6,})/);
-    return m ? m[1] : url || '—';
+    const s = String(url || '');
+    const m = s.match(/(m\d{6,})/);
+    if (m) return m[1];
+    const y = s.match(/\/auction\/([a-zA-Z]?\d+)/) || s.match(/^([a-zA-Z]?\d+)$/);
+    return y ? y[1] : url || '—';
   };
+  const targetNodeLabel = (rec) => {
+    if (rec.node_id === '*') return '全ノード（確認）';
+    if (!rec.node_id) return '既定プール';
+    return nodeLabel(rec.node_id);
+  };
+  const executorOf = (rec) =>
+    (rec.result && rec.result.executedBy) || rec.claimedBy || null;
   const hasOtherActiveRelist = (rec) =>
     taskList.value.some(
       (t) =>
@@ -58,9 +70,17 @@
         <template v-else-if="column.key === 'autoSubmit'">
           <a-tag :color="record.autoSubmit ? 'green' : 'default'">{{ record.autoSubmit ? 'ON' : 'OFF' }}</a-tag>
         </template>
+        <template v-else-if="column.key === 'platform'">
+          <a-tag :color="record.platform === 'yahoo' ? 'orange' : 'blue'">{{ platformName(record.platform) }}</a-tag>
+          <div v-if="record.type === 'verify'" class="task-node-sub">所有権確認</div>
+        </template>
         <template v-else-if="column.key === 'itemUrl'">
           <a v-if="record.itemUrl" :href="record.itemUrl" target="_blank">{{ mercariIdOf(record.itemUrl) }}</a>
           <span v-else>—</span>
+        </template>
+        <template v-else-if="column.key === 'node'">
+          <div>対象：{{ targetNodeLabel(record) }}</div>
+          <div v-if="executorOf(record)" class="task-node-sub">実行：{{ nodeLabel(executorOf(record)) }}</div>
         </template>
         <template v-else-if="column.key === 'createdAt'">
           {{ fmtTime(record.createdAt) }}
@@ -103,5 +123,9 @@
 }
 .task-none {
   color: #b6bcc6;
+}
+.task-node-sub {
+  color: #8a919c;
+  font-size: 12px;
 }
 </style>

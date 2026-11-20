@@ -1192,7 +1192,13 @@ async function createWindow() {
       }
       for (const t of managerServer.tasks.values()) {
         if (t.type === 'verify' && t.listing_id === record._id && t.status === 'pending') {
-          throw new Error('このレコードの所有権確認は既に実行待ちです')
+          // 既存の確認タスクがある場合はエラーにせず、試行済みノードを
+          // リセットして全ノードへ再配信する（再クリック＝再試行）。
+          t.attemptedBy = []
+          if (tasksDb) tasksDb.update({ id: t.id }, t, { upsert: true }, () => {})
+          sendTaskList()
+          e.sender.send('listing_result', { ok: true, claimed: true, reset: true })
+          return
         }
       }
       managerServer.addTask({
