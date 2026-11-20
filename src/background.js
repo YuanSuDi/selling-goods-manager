@@ -428,6 +428,7 @@ function startManagerServer() {
         persistTask(task)
         sendTaskList()
         await applyTaskResultToRecord(task, record)
+        sendInventoryMeta()
         return
       }
     }
@@ -584,6 +585,7 @@ function startManagerServer() {
     if (reporter && !record.node_id) {
       await inventory.updateListing(record._id, { node_id: reporter })
       updatedRecord.node_id = reporter
+      sendInventoryMeta()
     } else if (reporter && record.node_id && reporter !== record.node_id) {
       if (window && !window.isDestroyed()) {
         window.webContents.send('node_mismatch', {
@@ -723,15 +725,21 @@ function startManagerServer() {
     },
     onNodeSeen: (nodeId) => {
       if (!inventory) return
+      const isNewNode = !nodeInfoCache.has(nodeId)
       inventory
         .touchNode(nodeId)
         .then((n) => {
           if (n) nodeInfoCache.set(nodeId, { id: nodeId, name: n.name || null })
+          if (isNewNode) sendInventoryMeta()
         })
         .catch(() => {})
     },
     getNodeInfo: (nodeId) => nodeInfoCache.get(nodeId) || null,
-    onOwnershipClaim: handleOwnershipClaim,
+    onOwnershipClaim: async (claim) => {
+      const r = await handleOwnershipClaim(claim)
+      if (r && r.assigned) sendInventoryMeta()
+      return r
+    },
   })
   managerServer.listen().then(() => {
     managerInfo.running = true
