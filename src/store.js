@@ -59,6 +59,63 @@ export const applyListSearch = () => {
   }
 }
 
+// ---- 商品管理番号の種類（接頭辞）リスト ----
+// 初期値は従来コードに直書きされていた種類。追加・削除は商品一覧の
+// ツールバー「種類管理」から行い、検索条件と同じく localStorage に保存する。
+const noPrefixStorageKey = 'selling-goods-manager:no-prefixes'
+const defaultNoPrefixes = ['A', 'B', 'O', 'M', 'OT', 'C', 'D', 'E', 'F', 'G']
+function loadNoPrefixes() {
+  try {
+    const saved = JSON.parse(window.localStorage.getItem(noPrefixStorageKey) || 'null')
+    if (Array.isArray(saved)) {
+      return [...new Set(
+        saved
+          .filter((p) => typeof p === 'string')
+          .map((p) => p.trim().toUpperCase())
+          .filter((p) => /^[A-Z]+$/.test(p))
+      )]
+    }
+  } catch (error) {
+    console.warn('[store] Unable to restore product number prefixes:', error)
+  }
+  return [...defaultNoPrefixes]
+}
+export const noPrefixes = ref(loadNoPrefixes())
+watch(noPrefixes, () => {
+  try {
+    window.localStorage.setItem(noPrefixStorageKey, JSON.stringify(noPrefixes.value))
+  } catch (error) {
+    console.error('[store] Unable to save product number prefixes:', error)
+  }
+}, { deep: true })
+export const addNoPrefix = (raw) => {
+  const prefix = String(raw || '').trim().toUpperCase()
+  if (!/^[A-Z]+$/.test(prefix)) {
+    return { ok: false, error: '種類は英字のみで入力してください（例：AY）' }
+  }
+  if (noPrefixes.value.includes(prefix)) {
+    return { ok: false, error: 'その種類は既に登録されています' }
+  }
+  noPrefixes.value = [...noPrefixes.value, prefix]
+  return { ok: true, prefix }
+}
+export const removeNoPrefix = (raw) => {
+  const prefix = String(raw || '').trim().toUpperCase()
+  noPrefixes.value = noPrefixes.value.filter((p) => p !== prefix)
+  // 削除した種類で絞り込み中だった場合は、絞り込みを解除して全件に戻す
+  if (listSearch.selectedCategory === prefix) {
+    clearCategoryFilter()
+  }
+}
+export const clearCategoryFilter = () => {
+  listSearch.selectedCategory = undefined
+  if (listSearch.activeFilter === 'category') {
+    listSearch.activeFilter = null
+    isLoading.value = true
+    ipc.send('ping')
+  }
+}
+
 // 提示消息（エラー / 成功）
 export const alertDisFlg = ref(false)
 export const alertMsg = ref('test')

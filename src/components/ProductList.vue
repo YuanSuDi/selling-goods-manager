@@ -1,11 +1,11 @@
 <script setup>
-  import { ref, reactive } from 'vue'
+  import { ref, reactive, computed } from 'vue'
   import { EditOutlined, CheckOutlined } from '@ant-design/icons-vue';
   import { cloneDeep } from 'lodash-es';
   import {
     NO_IMAGE, dataSource, isLoading, lodingTip, currentItemNo,
     urlClick, openImgDir, selledItem, editInfo, openMercariBinding, openYahooBinding,
-    listSearch,
+    listSearch, noPrefixes, addNoPrefix, removeNoPrefix, clearCategoryFilter,
   } from '../store';
   import { normalizeProductImageUrl } from '../utils/product-image'
 
@@ -138,27 +138,9 @@
     window.ipcRenderer.send('searchByNo', searchValue)
   };
 
-  //添加商品分类过滤
-  const options = ref([
-    {
-      value: 'A',
-      label: 'A',
-    },
-    {
-      value: 'B',
-      label: 'B',
-    },
-    {value: 'O',label: 'O',},{value: 'M',label: 'M',},{value: 'OT',label: 'OT',},
-    {
-      value: 'C',
-      label: 'C',
-    },
-    {
-      value: 'D',
-      label: 'D',
-    },
-    {value: 'E',label: 'E',},{value: 'F', label: 'F',}, {value: 'G',label: 'G',},
-  ]);
+  //商品管理番号の種類で絞り込む。種類リストは store の noPrefixes
+  //（「種類管理」から追加・削除でき、localStorage に保存される）。
+  const options = computed(() => noPrefixes.value.map((p) => ({ value: p, label: p })));
   const filterOption = (input, option) => {
     return option.value.toLowerCase().indexOf(input.toLowerCase()) >= 0;
   };
@@ -166,6 +148,28 @@
     listSearch.selectedCategory = searchValue
     listSearch.activeFilter = 'category'
     window.ipcRenderer.send('searchBySelectNo', searchValue)
+  };
+
+  //種類の追加・削除
+  const prefixModalFlag = ref(false);
+  const newPrefix = ref('');
+  const prefixError = ref('');
+  const openPrefixModal = () => {
+    newPrefix.value = ''
+    prefixError.value = ''
+    prefixModalFlag.value = true
+  };
+  const submitNewPrefix = () => {
+    const res = addNoPrefix(newPrefix.value)
+    if (res.ok) {
+      newPrefix.value = ''
+      prefixError.value = ''
+    } else {
+      prefixError.value = res.error
+    }
+  };
+  const onRemovePrefix = (p) => {
+    removeNoPrefix(p)
   };
 
   //删除提示框
@@ -232,13 +236,16 @@
   <div class="toolbar">
     <a-select
       show-search
+      allow-clear
       placeholder="商品管理番号種類"
       style="width: 190px"
       :options="options"
       :filter-option="filterOption"
       v-model:value="listSearch.selectedCategory"
       @select="handleChange"
+      @clear="clearCategoryFilter"
     ></a-select>
+    <a-button @click="openPrefixModal">種類管理</a-button>
     <a-input-search
       v-model:value="listSearch.searchNo"
       placeholder="番号を入力"
@@ -342,6 +349,18 @@
         <a-input-number v-model:value="addProductCount" style="width: 100%" />
       </a-form-item>
     </a-form>
+  </a-modal>
+  <a-modal v-model:open="prefixModalFlag" title="商品管理番号の種類管理" :footer="null">
+    <div style="display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px;">
+      <a-tag v-for="p in noPrefixes" :key="p" closable @close.prevent="onRemovePrefix(p)">{{ p }}</a-tag>
+      <span v-if="!noPrefixes.length" style="color: #999;">種類が登録されていません</span>
+    </div>
+    <div style="display: flex; gap: 8px;">
+      <a-input v-model:value="newPrefix" placeholder="追加する種類（英字のみ、例：AY）" @pressEnter="submitNewPrefix" />
+      <a-button type="primary" @click="submitNewPrefix">追加</a-button>
+    </div>
+    <div v-if="prefixError" style="color: #ff4d4f; margin-top: 8px;">{{ prefixError }}</div>
+    <p style="color: #999; margin-top: 12px;">※ タグの × で削除できます。削除した種類で絞り込み中だった場合は絞り込みが解除されます。追加・削除は自動で保存されます。</p>
   </a-modal>
 </template>
 
