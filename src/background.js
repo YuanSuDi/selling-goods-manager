@@ -24,11 +24,14 @@ import axios from 'axios';
 import path from 'path';
 import puppeteer from 'puppeteer-core';
 import crypto from 'crypto';
-import Datastore from 'nedb';
 import { createManagerServer } from './manager-server';
 import { createInventoryV2, conditionStockTotal, parseListingId } from './inventory-v2';
 import { productImagePathFromRequest } from './utils/product-image'
 const { prepareUserDataDirectory } = require('./utils/user-data')
+const { createDatastores } = require('./main/datastores')
+const { createRelistTasks } = require('./main/relist-tasks')
+const { registerInventoryIpc } = require('./main/ipc-inventory')
+const { registerTaskIpc } = require('./main/ipc-tasks')
 
 
 const isDevelopment = process.env.NODE_ENV !== 'production'
@@ -101,142 +104,36 @@ async function setConditionStock(product, conditionId, nextStock) {
   return total
 }
 
-// Mercari の参照商品 URL を正規化する。完全な URL でも、m から始まる
-// 商品 ID だけでも受け付ける。解釈できなければ null。
-function normalizeMercariUrl(input) {
-  if (!input) return null
-  const s = String(input).trim()
-  const m = s.match(/jp\.mercari\.com\/item\/(m\d+)/) || s.match(/^(m\d+)$/)
-  return m ? 'https://jp.mercari.com/item/' + m[1] : null
+// 抽出モジュール（src/main/*）へ渡す共有コンテキスト。実体はこのファイルの
+// モジュール状態で、getter 経由で常に最新を返す（初期化順序に依存しない）。
+const ctx = {
+  get db() { return db },
+  get tasksDb() { return tasksDb },
+  get inventory() { return inventory },
+  get managerServer() { return managerServer },
+  get defaultConditionId() { return defaultConditionId },
+  nodeInfoCache,
+  dbFindOne,
+  dbUpdate,
+  refreshRenderer,
+  sendTaskList,
+  sendInventoryMeta,
 }
 
-// Yahoo!オークションの参照商品 URL を正規化する。完全な URL でも、
-// オークション ID（英字0〜1文字+数字。古い商品は数字のみ）だけでも
-// 受け付ける。解釈できなければ null。
-function normalizeYahooUrl(input) {
-  if (!input) return null
-  const s = String(input).trim()
-  const m =
-    s.match(/auctions\.yahoo\.co\.jp\/jp\/auction\/([a-z]?\d+)/) ||
-    s.match(/^([a-z]?\d+)$/)
-  return m ? 'https://auctions.yahoo.co.jp/jp/auction/' + m[1] : null
-}
-
-// プラットフォームごとの参照まわりの対応表。
-function platformBinding(platform) {
-  return platform === 'yahoo'
-    ? {
-        refField: 'yahoo_ref',
-        autoField: 'yahoo_auto_restock',
-        errorField: 'yahoo_list_error',
-        dedupeField: 'last_processed_yahoo_sale_item_id',
-        normalize: normalizeYahooUrl,
-        refSegment: 'auction/',
-        label: 'Yahoo!オークション',
-      }
-    : {
-        refField: 'mercari_ref',
-        autoField: 'auto_restock',
-        errorField: 'list_error',
-        dedupeField: 'last_processed_sale_item_id',
-        normalize: normalizeMercariUrl,
-        refSegment: 'item/',
-        label: 'Mercari',
-      }
-}
-
-// 同じプラットフォームで、同じ商品番号または同じ商品IDの再出品タスクが
-// 実行待ち・実行中なら true（別プラットフォームのタスクとは競合しない）。
-function hasActiveRelistTask(product_no, itemUrl, platform) {
-  if (!managerServer) return false
-  const plat = platform === 'yahoo' ? 'yahoo' : 'mercari'
-  const normalize = platformBinding(plat).normalize
-  for (const t of managerServer.tasks.values()) {
-    if (
-      t.type === 'relist' &&
-      (t.platform || 'mercari') === plat &&
-      (t.status === 'pending' || t.status === 'running') &&
-      (
-        (product_no != null && t.product_no === product_no) ||
-        (itemUrl && normalize(t.itemUrl) === itemUrl)
-      )
-    ) {
-      return true
-    }
-  }
-  return false
-}
-
-// 出品レコード単位で「実行待ち・実行中」の再出品タスクがあるか。
-function hasActiveTaskForRecord(record) {
-  if (!managerServer || !record) return false
-  for (const t of managerServer.tasks.values()) {
-    if (
-      t.type === 'relist' &&
-      (t.status === 'pending' || t.status === 'running') &&
-      t.listing_id === record._id
-    ) {
-      return true
-    }
-  }
-  return false
-}
-
-// 出品レコードから再出品タスクを作る（v0.2.0 の正規ルート）。
-// タスクにはレコード ID と担当ノードを引き継ぐ。
-function createRelistTaskForRecord(record, autoSubmit, trigger) {
-  if (!managerServer) throw new Error('連携サーバが起動していません')
-  if (!record || !record.listing_url) throw new Error('参照商品のURLが未設定です')
-  if (hasActiveTaskForRecord(record)) {
-    throw new Error('このレコードの出品タスクが既に実行待ちです')
-  }
-  if (hasActiveRelistTask(record.product_no, record.listing_url, record.platform)) {
-    throw new Error('同じ商品番号または商品IDの出品タスクが既に実行待ちです')
-  }
-  const task = managerServer.addTask({
-    product_no: record.product_no,
-    platform: record.platform,
-    type: 'relist',
-    itemUrl: record.listing_url,
-    autoSubmit: !!autoSubmit,
-    trigger: trigger || 'manual',
-    condition_id: record.condition_id,
-    listing_id: record._id,
-    node_id: record.node_id || '',
-  })
-  sendTaskList()
-  return task
-}
-
-// 参照商品をブラウザでコピーして再出品するタスクを作る。
-// v0.2.0: 対応する出品レコードがあればレコード経由で作る。
-async function createRelistTask(product, autoSubmit, trigger, platform) {
-  if (!managerServer) throw new Error('連携サーバが起動していません')
-  const plat = platform === 'yahoo' ? 'yahoo' : 'mercari'
-  const bind = platformBinding(plat)
-  const itemUrl = bind.normalize(product[bind.refField])
-  if (!itemUrl) throw new Error('参照商品のURLが未設定です')
-  if (inventory) {
-    const lid = parseListingId(plat, itemUrl)
-    const record = lid ? await inventory.findRecordByListingId(plat, lid) : null
-    if (record && record.product_no === product.product_no) {
-      return createRelistTaskForRecord(record, autoSubmit, trigger)
-    }
-  }
-  if (hasActiveRelistTask(product.product_no, itemUrl, plat)) {
-    throw new Error('同じ商品番号または' + bind.label + '商品IDの出品タスクが既に実行待ちです')
-  }
-  const task = managerServer.addTask({
-    product_no: product.product_no,
-    platform: plat,
-    type: 'relist',
-    itemUrl,
-    autoSubmit: !!autoSubmit,
-    trigger: trigger || 'manual',
-  })
-  sendTaskList()
-  return task
-}
+// 再出品タスクまわりは src/main/relist-tasks.js へ分離。このファイル内では
+// 従来どおりの名前で使う。
+const {
+  normalizeMercariUrl,
+  normalizeYahooUrl,
+  platformBinding,
+  hasActiveRelistTask,
+  hasActiveTaskForRecord,
+  createRelistTaskForRecord,
+  createRelistTask,
+} = createRelistTasks(ctx)
+ctx.platformBinding = platformBinding
+ctx.hasActiveRelistTask = hasActiveRelistTask
+ctx.createRelistTaskForRecord = createRelistTaskForRecord
 
 // 商品データの変更後、レンダラが現在の検索条件で再取得できるよう通知する。
 function refreshRenderer() {
@@ -1108,215 +1005,9 @@ async function createWindow() {
   })
 
   // ---- v0.2.0: 状態・レコード・ノード管理 IPC ----
-  ipcMain.on('get_inventory_meta', () => {
-    sendInventoryMeta()
-  })
+  registerInventoryIpc(ctx)
 
-  ipcMain.on('condition_save', async (e, data) => {
-    const result = inventory
-      ? await inventory.saveCondition(data || {})
-      : { ok: false, error: 'データ層が初期化されていません。' }
-    e.sender.send('condition_result', result)
-    if (result.ok) sendInventoryMeta()
-  })
-
-  ipcMain.on('condition_delete', async (e, data) => {
-    const result = inventory
-      ? await inventory.deleteCondition((data || {}).id)
-      : { ok: false, error: 'データ層が初期化されていません。' }
-    e.sender.send('condition_result', result)
-    if (result.ok) sendInventoryMeta()
-  })
-
-  ipcMain.on('listing_save', async (e, data) => {
-    const result = inventory
-      ? await inventory.saveListing(data || {})
-      : { ok: false, error: 'データ層が初期化されていません。' }
-    if (result.ok && result.listing) {
-      // 既定状態のレコードは旧フィールドへ二重書きする。
-      const rec = result.listing
-      if (rec.condition_id === defaultConditionId) {
-        const bind = platformBinding(rec.platform)
-        await dbUpdate(db, { product_no: rec.product_no }, {
-          $set: { [bind.refField]: rec.listing_url, [bind.autoField]: !!rec.auto_restock },
-        })
-        refreshRenderer()
-      }
-    }
-    e.sender.send('listing_result', result)
-    if (result.ok) sendInventoryMeta()
-  })
-
-  ipcMain.on('listing_delete', async (e, data) => {
-    const result = inventory
-      ? await inventory.deleteListing((data || {}).id)
-      : { ok: false, error: 'データ層が初期化されていません。' }
-    if (result.ok && result.listing && result.listing.condition_id === defaultConditionId) {
-      const bind = platformBinding(result.listing.platform)
-      const rest = (await inventory.listListings(result.listing.product_no)).filter(
-        (r) => r.platform === result.listing.platform && r.condition_id === defaultConditionId
-      )
-      if (!rest.length) {
-        await dbUpdate(db, { product_no: result.listing.product_no }, {
-          $set: { [bind.refField]: null, [bind.autoField]: false },
-        })
-        refreshRenderer()
-      }
-    }
-    e.sender.send('listing_result', result)
-    if (result.ok) sendInventoryMeta()
-  })
-
-  ipcMain.on('listing_relist', async (e, data) => {
-    try {
-      const record = inventory ? await inventory.getListing((data || {}).id) : null
-      if (!record) {
-        e.sender.send('listing_result', { ok: false, error: 'レコードが見つかりません。' })
-        return
-      }
-      const product = await dbFindOne(db, { product_no: record.product_no })
-      const condStock = product && product.condition_stock
-        ? Number(product.condition_stock[record.condition_id] || 0)
-        : 0
-      if (!(condStock > 0)) {
-        e.sender.send('listing_result', { ok: false, error: 'その状態の在庫がありません。' })
-        return
-      }
-      const task = createRelistTaskForRecord(record, true, 'manual')
-      e.sender.send('list_task_created', { ok: true, task, auto: false })
-    } catch (err) {
-      e.sender.send('listing_result', { ok: false, error: String((err && err.message) || err) })
-    }
-  })
-
-  ipcMain.on('listing_claim', async (e, data) => {
-    try {
-      if (!managerServer) throw new Error('連携サーバが起動していません')
-      const record = inventory ? await inventory.getListing((data || {}).id) : null
-      if (!record) {
-        e.sender.send('listing_result', { ok: false, error: 'レコードが見つかりません。' })
-        return
-      }
-      for (const t of managerServer.tasks.values()) {
-        if (t.type === 'verify' && t.listing_id === record._id && t.status === 'pending') {
-          // 既存の確認タスクがある場合はエラーにせず、試行済みノードを
-          // リセットして全ノードへ再配信する（再クリック＝再試行）。
-          t.attemptedBy = []
-          if (tasksDb) tasksDb.update({ id: t.id }, t, { upsert: true }, () => {})
-          sendTaskList()
-          e.sender.send('listing_result', { ok: true, claimed: true, reset: true })
-          return
-        }
-      }
-      managerServer.addTask({
-        product_no: record.product_no,
-        platform: record.platform,
-        type: 'verify',
-        itemUrl: record.listing_url,
-        autoSubmit: false,
-        trigger: 'claim',
-        condition_id: record.condition_id,
-        listing_id: record._id,
-        node_id: '*',
-      })
-      sendTaskList()
-      e.sender.send('listing_result', { ok: true, claimed: true })
-    } catch (err) {
-      e.sender.send('listing_result', { ok: false, error: String((err && err.message) || err) })
-    }
-  })
-
-  ipcMain.on('listing_fix_node', async (e, data) => {
-    const result = inventory
-      ? await inventory.updateListing((data || {}).id, { node_id: (data || {}).node_id || '' })
-          .then((rec) => ({ ok: !!rec, listing: rec }))
-          .catch((err) => ({ ok: false, error: String((err && err.message) || err) }))
-      : { ok: false, error: 'データ層が初期化されていません。' }
-    e.sender.send('listing_result', result)
-    if (result.ok) sendInventoryMeta()
-  })
-
-  ipcMain.on('node_rename', async (e, data) => {
-    const result = inventory
-      ? await inventory.renameNode((data || {}).nodeId, (data || {}).name)
-      : { ok: false, error: 'データ層が初期化されていません。' }
-    if (result.ok && result.node) {
-      nodeInfoCache.set(result.node._id, { id: result.node._id, name: result.node.name || null })
-    }
-    e.sender.send('node_result', result)
-    if (result.ok) sendInventoryMeta()
-  })
-
-  ipcMain.on('node_delete', async (e, data) => {
-    const result = inventory
-      ? await inventory.deleteNode((data || {}).nodeId)
-      : { ok: false, error: 'データ層が初期化されていません。' }
-    if (result.ok) nodeInfoCache.delete((data || {}).nodeId)
-    e.sender.send('node_result', result)
-    if (result.ok) sendInventoryMeta()
-  })
-
-  //現在のタスク一覧を返す
-  ipcMain.on('list_tasks', () => {
-    sendTaskList()
-  })
-
-  // タスク停止: pending は拡張機能に渡らなくなる。running は既に拡張機能が
-  // 処理中の可能性があるため状態だけ止める（結果が返れば通常どおり記録）。
-  ipcMain.on('task_stop', (e, taskId) => {
-    const task = managerServer && managerServer.tasks.get(taskId)
-    if (task && (task.status === 'pending' || task.status === 'running')) {
-      task.status = 'stopped'
-      tasksDb.update({ id: task.id }, task, { upsert: true }, () => {})
-      console.log('[manager] task stopped:', task.id)
-    }
-    sendTaskList()
-  })
-
-  // タスク起動: 停止中・失敗のタスクを pending に戻す（拡張機能が約1分
-  // 以内に拾う）。同じ商品番号または Mercari 商品 ID に実行待ち/実行中の
-  // 再出品がある場合は二重出品防止のため起動しない。
-  ipcMain.on('task_start', (e, taskId) => {
-    const task = managerServer && managerServer.tasks.get(taskId)
-    if (task && (task.status === 'stopped' || task.status === 'failed')) {
-      const bind = platformBinding(task.platform)
-      const dup =
-        task.type === 'relist' &&
-        hasActiveRelistTask(
-          task.product_no,
-          bind.normalize(task.itemUrl),
-          task.platform
-        )
-      if (!dup) {
-        task.status = 'pending'
-        tasksDb.update({ id: task.id }, task, { upsert: true }, () => {})
-        console.log('[manager] task restarted:', task.id)
-        if (task.type === 'relist' && task.product_no) {
-          db.update(
-            { product_no: task.product_no },
-            { $set: { [bind.errorField]: null } },
-            () => refreshRenderer()
-          )
-          if (inventory && task.listing_id) {
-            inventory.updateListing(task.listing_id, { error: null, status: 'active' }).catch(() => {})
-          }
-        }
-      } else {
-        console.log('[manager] task start refused (active relist exists):', task.id)
-      }
-    }
-    sendTaskList()
-  })
-
-  // タスク削除: 記録ごと消す。実行中だった場合、結果は記録されない。
-  ipcMain.on('task_delete', (e, taskId) => {
-    if (managerServer && managerServer.tasks.has(taskId)) {
-      managerServer.tasks.delete(taskId)
-      tasksDb.remove({ id: taskId }, {}, () => {})
-      console.log('[manager] task deleted:', taskId)
-    }
-    sendTaskList()
-  })
+  registerTaskIpc(ctx)
   if (process.env.WEBPACK_DEV_SERVER_URL) {
     // Load the url of the dev server if in development mode
     await window.loadURL(process.env.WEBPACK_DEV_SERVER_URL)
@@ -1440,27 +1131,13 @@ app.whenReady().then(async () => {
   if (preparedData.migrated) {
     console.info('[storage] Legacy user data copied to the application data directory')
   }
-  const database = require('./nedb/db')
-  db = database.initializeDatabase(userDataDir)
-  getAll = database.getAll
-  tasksDb = new Datastore({
-    filename: path.join(userDataDir, 'tasks.db'),
-    autoload: true,
-  })
-  // v0.2.0: 状態・出品レコード・ノードの各 DB を用意し、サーバ起動前に
-  // 旧形式からの移行を済ませる（移行は冪等）。
-  conditionsDb = new Datastore({
-    filename: path.join(userDataDir, 'conditions.db'),
-    autoload: true,
-  })
-  listingsDb = new Datastore({
-    filename: path.join(userDataDir, 'listings.db'),
-    autoload: true,
-  })
-  nodesDb = new Datastore({
-    filename: path.join(userDataDir, 'nodes.db'),
-    autoload: true,
-  })
+  const stores = createDatastores(userDataDir)
+  db = stores.db
+  getAll = stores.getAll
+  tasksDb = stores.tasksDb
+  conditionsDb = stores.conditionsDb
+  listingsDb = stores.listingsDb
+  nodesDb = stores.nodesDb
   inventory = createInventoryV2({
     productsDb: db,
     conditionsDb,
