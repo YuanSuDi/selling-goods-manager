@@ -218,8 +218,8 @@ export const openImgDir = (dir) => {
 
 // v0.2.0: 状態を指定して販売する。在庫計算はメインプロセス側が
 // 状態別在庫に対して行うため、ここでは楽観更新をしない。
-export const selledItem = (product_no, condition_id) => {
-  ipc.send('selledItem', { product_no, condition_id: condition_id || null })
+export const selledItem = (product_no, condition_id, record_id) => {
+  ipc.send('selledItem', { product_no, condition_id: condition_id || null, record_id: record_id || null })
 }
 
 //商品情报提交（手動追加）

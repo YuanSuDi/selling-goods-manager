@@ -220,26 +220,56 @@
     ...nodes.value.map((n) => ({ value: n._id, label: n.name || ('無名（' + String(n._id).slice(0, 6) + '）') })),
   ]);
 
-  // ---- 1件販売（状態が複数あれば選択モーダル） ----
+  // ---- 1件販売（状態→売れた出品の順に選択） ----
   const salePickFlag = ref(false);
+  const salePickStep = ref('condition');
   const salePickProductNo = ref('');
   const salePickCondId = ref(null);
+  const salePickRecordId = ref(null);
   const salePickProduct = computed(
     () => dataSource.value.find((p) => p.product_no === salePickProductNo.value) || null
   );
+  const salePickRecords = computed(() =>
+    salePickCondId.value
+      ? recordsForCondition(salePickProductNo.value, salePickCondId.value)
+      : []
+  );
+  const doSell = () => {
+    selledItem(salePickProductNo.value, salePickCondId.value, salePickRecordId.value)
+    salePickFlag.value = false
+  };
   const onSellClick = (record) => {
     const stocked = stockedConditions(record)
-    if (stocked.length === 1) {
-      selledItem(record.product_no, stocked[0].id)
-    } else if (stocked.length > 1) {
-      salePickProductNo.value = record.product_no
-      salePickCondId.value = stocked[0].id
+    if (!stocked.length) return
+    salePickProductNo.value = record.product_no
+    salePickCondId.value = stocked[0].id
+    salePickRecordId.value = null
+    if (stocked.length > 1) {
+      salePickStep.value = 'condition'
       salePickFlag.value = true
+      return
+    }
+    // 状態が1つでも、その状態の出品レコードが複数あれば売れた出品を選ぶ
+    const recs = recordsForCondition(record.product_no, stocked[0].id)
+    if (recs.length > 1) {
+      salePickStep.value = 'record'
+      salePickRecordId.value = recs[0]._id
+      salePickFlag.value = true
+    } else {
+      selledItem(record.product_no, stocked[0].id, recs.length === 1 ? recs[0]._id : null)
     }
   };
   const confirmSalePick = () => {
-    if (salePickCondId.value) selledItem(salePickProductNo.value, salePickCondId.value)
-    salePickFlag.value = false
+    if (salePickStep.value === 'condition') {
+      const recs = salePickRecords.value
+      if (recs.length > 1) {
+        salePickRecordId.value = recs[0]._id
+        salePickStep.value = 'record'
+        return
+      }
+      salePickRecordId.value = recs.length === 1 ? recs[0]._id : null
+    }
+    doSell()
   };
 
   // ---- 状態管理モーダル ----
@@ -535,12 +565,20 @@
     </template>
   </a-modal>
 
-  <a-modal v-model:open="salePickFlag" title="販売する状態を選択" @ok="confirmSalePick">
-    <a-radio-group v-if="salePickProduct" v-model:value="salePickCondId" style="display: flex; flex-direction: column; gap: 8px;">
+  <a-modal v-model:open="salePickFlag" :title="salePickStep === 'condition' ? '販売する状態を選択' : '売れた出品を選択'" @ok="confirmSalePick">
+    <a-radio-group v-if="salePickStep === 'condition' && salePickProduct" v-model:value="salePickCondId" style="display: flex; flex-direction: column; gap: 8px;">
       <a-radio v-for="c in stockedConditions(salePickProduct)" :key="c.id" :value="c.id">
         {{ c.name }}（在庫 {{ c.count }}）
       </a-radio>
     </a-radio-group>
+    <template v-else>
+      <a-radio-group v-model:value="salePickRecordId" style="display: flex; flex-direction: column; gap: 8px;">
+        <a-radio v-for="r in salePickRecords" :key="r._id" :value="r._id">
+          {{ platformName(r.platform) }} {{ r.listing_id }}（{{ nodeLabel(r.node_id) }}）<span v-if="!r.auto_restock"> ※自動補充OFF</span>
+        </a-radio>
+      </a-radio-group>
+      <p style="color: #8a919c; font-size: 12px; margin-top: 8px;">売れたのは1点だけです。補充されるのは、ここで選んだ出品だけです。</p>
+    </template>
   </a-modal>
 
   <a-modal v-model:open="condMgrFlag" title="状態管理" :footer="null">

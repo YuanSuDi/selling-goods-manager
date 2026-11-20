@@ -1010,31 +1010,38 @@ async function createWindow() {
       const newSoldNum = Number(product.selled_num || 0) + 1
       await dbUpdate(db, { product_no: product.product_no }, { $set: { condition_sold: soldMap, selled_num: newSoldNum } })
       refreshRenderer()
-      // 自動補充: 売れた状態に紐づくレコードのうち自動補充 ON のものを、
-      // プラットフォームを問わずすべて補充する（状態＝実物、レコード＝販路）。
+      // 自動補充: 手動の1件販売で売れた出品は1つだけ。指定されたレコード
+      // （なければ、その状態の唯一のレコード）だけを補充する。
       if (!managerServer || !inventory) return
       if (!(newCondStock > 0)) return
       const allRecords = await inventory.listListings(product.product_no)
-      const condRecords = allRecords.filter(
-        (r) => r.condition_id === condId && r.auto_restock
-      )
+      const condRecords = allRecords.filter((r) => r.condition_id === condId)
       if (condRecords.length) {
-        for (const record of condRecords) {
-          const newRecordSold = Number(record.sold_count || 0) + 1
-          await inventory.updateListing(record._id, {
+        let target = null
+        if (data.record_id) {
+          target = condRecords.find((r) => r._id === data.record_id) || null
+        } else if (condRecords.length === 1) {
+          target = condRecords[0]
+        }
+        if (target && target.auto_restock) {
+          const newRecordSold = Number(target.sold_count || 0) + 1
+          await inventory.updateListing(target._id, {
             sold_count: newRecordSold,
             error: null,
             status: 'active',
           })
-          if (record.quota != null && newRecordSold >= Number(record.quota)) continue
-          try {
-            const task = createRelistTaskForRecord(record, true, 'manual-sale')
-            if (window && !window.isDestroyed()) {
-              window.webContents.send('list_task_created', { ok: true, task, auto: true })
+          if (!(target.quota != null && newRecordSold >= Number(target.quota))) {
+            try {
+              const task = createRelistTaskForRecord(target, true, 'manual-sale')
+              if (window && !window.isDestroyed()) {
+                window.webContents.send('list_task_created', { ok: true, task, auto: true })
+              }
+            } catch (err) {
+              console.warn('[manager] auto restock skipped:', err && err.message)
             }
-          } catch (err) {
-            console.warn('[manager] auto restock skipped:', err && err.message)
           }
+        } else if (!target && condRecords.length > 1) {
+          e.sender.send('manual_sale_multi_record', { product_no: product.product_no, condition_id: condId })
         }
       } else if (!allRecords.length && product.auto_restock && product.mercari_ref) {
         // レコードが1件もない旧データ向けフォールバック
