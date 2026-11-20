@@ -8,6 +8,12 @@
       nodes.value.forEach((n) => { nodeDrafts[n._id] = n.name || '' })
     }
   });
+  // 開いた後に現れたノードも空欄にならないよう、未登録の下書きだけ補う。
+  watch(nodes, (list) => {
+    list.forEach((n) => {
+      if (!(n._id in nodeDrafts)) nodeDrafts[n._id] = n.name || ''
+    })
+  });
   const fmtSeen = (ts) => {
     if (!ts) return '—'
     const d = new Date(ts)

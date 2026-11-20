@@ -1,5 +1,5 @@
 <script setup>
-  import { ref, reactive, computed } from 'vue'
+  import { ref, reactive, computed, watch } from 'vue'
   import { EditOutlined, CheckOutlined } from '@ant-design/icons-vue';
   import { cloneDeep } from 'lodash-es';
   import {
@@ -251,6 +251,13 @@
     newCondName.value = ''
     condMgrFlag.value = true
   };
+  // モーダルを開いた後に追加された状態は下書きが無いと空欄に見えるため、
+  // 未登録の下書きだけを随時補う（編集中の下書きは上書きしない）。
+  watch(conditions, (list) => {
+    list.forEach((c) => {
+      if (!(c._id in condDrafts)) condDrafts[c._id] = c.name
+    })
+  });
   const saveCondRename = (c) => {
     const name = String(condDrafts[c._id] || '').trim()
     if (name && name !== c.name) saveCondition({ id: c._id, name })
@@ -460,7 +467,7 @@
         <a-select
           v-model:value="addCondId"
           style="width: 100%"
-          :options="conditions.map((c) => ({ value: c._id, label: c.name + (c.is_default ? '（既定）' : '') }))"
+          :options="conditions.map((c) => ({ value: c._id, label: c.name + (c.isDefault ? '（既定）' : '') }))"
         />
       </a-form-item>
       <a-form-item label="入荷数">
@@ -487,7 +494,7 @@
         <div class="ref-detail-head">
           <span class="ref-detail-name">
             {{ cond.name }}
-            <a-tag v-if="cond.is_default" color="default">既定</a-tag>
+            <a-tag v-if="cond.isDefault" color="default">既定</a-tag>
           </span>
           <span class="ref-detail-stock">在庫 {{ conditionStock(refDetailProduct, cond._id) }} / 販売 {{ conditionSold(refDetailProduct, cond._id) }}</span>
           <a-button size="small" @click="openListingEdit(null, cond._id)">レコード追加</a-button>
@@ -539,9 +546,9 @@
   <a-modal v-model:open="condMgrFlag" title="状態管理" :footer="null">
     <div v-for="c in conditions" :key="c._id" class="cond-row">
       <a-input v-model:value="condDrafts[c._id]" style="flex: 1" />
-      <a-tag v-if="c.is_default" color="default">既定</a-tag>
+      <a-tag v-if="c.isDefault" color="default">既定</a-tag>
       <a-button size="small" @click="saveCondRename(c)">保存</a-button>
-      <a-button size="small" danger :disabled="c.is_default" @click="removeCond(c)">削除</a-button>
+      <a-button size="small" danger :disabled="c.isDefault" @click="removeCond(c)">削除</a-button>
     </div>
     <div style="display: flex; gap: 8px; margin-top: 12px;">
       <a-input v-model:value="newCondName" placeholder="新しい状態（例：九成新）" @pressEnter="addCond" />

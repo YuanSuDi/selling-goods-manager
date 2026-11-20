@@ -440,7 +440,7 @@ ipc.on('inventory_meta', (e, meta) => {
 ipc.send('get_inventory_meta')
 
 export const defaultCondition = computed(
-  () => conditions.value.find((c) => c.is_default) || conditions.value[0] || null
+  () => conditions.value.find((c) => c.isDefault) || conditions.value[0] || null
 )
 export const conditionName = (id) => {
   const c = conditions.value.find((x) => x._id === id)
