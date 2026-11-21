@@ -258,9 +258,18 @@ function startManagerServer() {
     const bornNode = record.node_id || executedBy || ''
     if (task.result && task.result.ok) {
       if (record.platform === 'yahoo') {
-        await inventory.updateListing(record._id, { error: null, status: 'active', node_id: bornNode })
+        // Yahoo の再出品は新しいオークション ID で公開されるため、結果 URL
+        // から ID を取り直してレコードを上書きする（販売照合は ID 基準で、
+        // 旧 ID のままだと次の販売に一致しなくなる）。
+        const listingUrl = normalizeYahooUrl(task.result.listingUrl) || record.listing_url
+        const newListingId = listingUrl ? parseListingId('yahoo', listingUrl) : null
+        const patch = { error: null, status: 'active', node_id: bornNode }
+        if (newListingId) {
+          patch.listing_id = newListingId
+          patch.listing_url = listingUrl
+        }
+        await inventory.updateListing(record._id, patch)
         if (isDefaultRecord) {
-          const listingUrl = normalizeYahooUrl(task.result.listingUrl) || record.listing_url
           db.update(
             { product_no: record.product_no },
             { $set: { yahoo_ref: listingUrl, yahoo_list_error: null } },
