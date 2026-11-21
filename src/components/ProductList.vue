@@ -5,7 +5,7 @@
   import {
     NO_IMAGE, dataSource, isLoading, lodingTip, currentItemNo,
     urlClick, openImgDir, selledItem, editInfo,
-    listSearch, noPrefixes, addNoPrefix, removeNoPrefix, clearCategoryFilter,
+    listSearch, noPrefixes, addNoPrefix, removeNoPrefix, clearCategoryFilter, clearAllListFilters,
     refDetailFlag, refDetailProductNo, refDetailProduct, openRefDetail,
     conditions, nodes, defaultCondition, conditionName, nodeLabel,
     recordsFor, recordsForCondition, conditionStock, conditionSold, stockedConditions,
@@ -26,6 +26,12 @@
     if (autoFilter.value === 'none') return dataSource.value.filter((p) => !hasAutoRestock(p))
     return dataSource.value
   })
+
+  // ---- 全条件クリア（番号・商品名・種類・自動補充を戻して全件再検索） ----
+  const onClearAllFilters = () => {
+    autoFilter.value = 'all'
+    clearAllListFilters()
+  }
 
   const pagination = ref({
     position: ['bottomRight'],
@@ -429,6 +435,7 @@
         { value: 'none', label: '自動補充：なし' },
       ]"
     ></a-select>
+    <a-button @click="onClearAllFilters">条件クリア</a-button>
   </div>
 
   <a-table :dataSource="visibleData" :columns="columns" rowKey="product_no" :pagination="pagination" :scroll="{ x: 1440 }">

@@ -116,6 +116,18 @@ export const clearCategoryFilter = () => {
   }
 }
 
+// 検索条件をすべて解除して全件表示に戻す（番号・商品名・種類・有効な
+// フィルタ種別をリセットし、全件読み込みの ping を送る）。自動補充
+// フィルタは ProductList 側の表示フィルタなので、そちらで戻すこと。
+export const clearAllListFilters = () => {
+  listSearch.nameSearch = ''
+  listSearch.searchNo = ''
+  listSearch.selectedCategory = undefined
+  listSearch.activeFilter = null
+  isLoading.value = true
+  ipc.send('ping')
+}
+
 // 提示消息（エラー / 成功）
 export const alertDisFlg = ref(false)
 export const alertMsg = ref('test')
