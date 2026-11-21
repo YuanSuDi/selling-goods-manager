@@ -21,6 +21,15 @@
     stopped: { label: '停止', color: 'default' },
   };
   const taskStatusMeta = (s) => TASK_STATUS[s] || { label: s || '?', color: 'default' };
+  // 起動元（trigger）の表示名。未知の値は誤解を避けるためそのまま出す。
+  const TRIGGER_LABELS = {
+    manual: '手動',
+    'manual-sale': '手動売却',
+    'mercari-todo': '売出監視',
+    'yahoo-sold': 'ヤフオク売却',
+    claim: '所有権確認',
+  };
+  const triggerLabel = (t) => TRIGGER_LABELS[t] || t || '手動';
   const fmtTime = (iso) => {
     if (!iso) return '—';
     const d = new Date(iso);
@@ -65,7 +74,7 @@
           <a-tag :color="taskStatusMeta(record.status).color">{{ taskStatusMeta(record.status).label }}</a-tag>
         </template>
         <template v-else-if="column.key === 'trigger'">
-          {{ record.trigger === 'mercari-todo' ? '売出監視' : record.trigger === 'manual-sale' ? '手動売却' : '手動' }}
+          {{ triggerLabel(record.trigger) }}
         </template>
         <template v-else-if="column.key === 'autoSubmit'">
           <a-tag :color="record.autoSubmit ? 'green' : 'default'">{{ record.autoSubmit ? 'ON' : 'OFF' }}</a-tag>
