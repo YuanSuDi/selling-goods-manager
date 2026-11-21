@@ -261,13 +261,40 @@ function createManagerServer(options) {
         if (task.claimedBy && reqNodeId && task.claimedBy !== reqNodeId) {
           return sendJson(res, 403, { ok: false, error: "task is claimed by another node" });
         }
-        task.status = "pending";
-        task.claimedBy = null;
+        // 担当ノード自身が「所有権なし」で返却し続けるレコード紐付き
+        // 再出品タスクは、他ノードが引き継ぐこともできない。このままだと
+        // 実行中⇔実行待ちを永遠に往復するため、3 回目の返却で失敗にする。
+        const ownNodeNotOwner =
+          task.type === "relist" &&
+          task.node_id &&
+          task.node_id !== "*" &&
+          reqNodeId &&
+          task.node_id === reqNodeId &&
+          (body.reason || null) === "not-owner";
+        if (ownNodeNotOwner) {
+          task.notOwnerReleases = (task.notOwnerReleases || 0) + 1;
+        }
         task.releaseNote = {
           by: reqNodeId,
           reason: body.reason || null,
           at: new Date().toISOString(),
         };
+        if (ownNodeNotOwner && task.notOwnerReleases >= 3) {
+          task.status = "failed";
+          task.claimedBy = null;
+          task.result = {
+            ok: false,
+            listingUrl: null,
+            message:
+              "担当ノードが「所有権なし」で返却を繰り返したため失敗にしました。再出品ページが操作できない状態です（すでに再出品済み・落札済みなど）。",
+            at: new Date().toISOString(),
+            executedBy: reqNodeId,
+          };
+          if (onTaskResult) onTaskResult(task);
+          return sendJson(res, 200, { ok: true, task, gaveUp: true });
+        }
+        task.status = "pending";
+        task.claimedBy = null;
         if (onTaskReleased) onTaskReleased(task);
         return sendJson(res, 200, { ok: true, task });
       }

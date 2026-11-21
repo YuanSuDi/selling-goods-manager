@@ -38,6 +38,7 @@ function registerTaskIpc(ctx) {
         )
       if (!dup) {
         task.status = 'pending'
+        task.notOwnerReleases = 0
         ctx.tasksDb.update({ id: task.id }, task, { upsert: true }, () => {})
         console.log('[manager] task restarted:', task.id)
         if (task.type === 'relist' && task.product_no) {
