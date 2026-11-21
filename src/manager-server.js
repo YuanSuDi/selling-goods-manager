@@ -72,9 +72,14 @@ function createManagerServer(options) {
     if (!body || !body.platform) {
       throw new Error("platform is required");
     }
-    const type = body.type === "relist" ? "relist" : body.type === "verify" ? "verify" : "listing";
-    if ((type === "relist" || type === "verify") && !body.itemUrl) {
-      throw new Error("itemUrl is required for relist/verify tasks");
+    const type =
+      body.type === "relist" ? "relist"
+      : body.type === "verify" ? "verify"
+      : body.type === "delist" ? "delist"
+      : body.type === "manual-delist" ? "manual-delist"
+      : "listing";
+    if ((type === "relist" || type === "verify" || type === "delist") && !body.itemUrl) {
+      throw new Error("itemUrl is required for relist/verify/delist tasks");
     }
     if (type === "listing" && !body.title) {
       throw new Error("title is required");
@@ -93,7 +98,13 @@ function createManagerServer(options) {
       node_id: body.node_id != null ? String(body.node_id) : "",
       attemptedBy: [],
       claimedBy: null,
-      itemUrl: type === "relist" || type === "verify" ? String(body.itemUrl) : null,
+      itemUrl:
+        type === "relist" || type === "verify" || type === "delist" || type === "manual-delist"
+          ? body.itemUrl
+            ? String(body.itemUrl)
+            : null
+          : null,
+      manualReason: body.manualReason ? String(body.manualReason) : null,
       title: body.title
         ? String(body.title)
         : type === "relist"
@@ -347,6 +358,8 @@ function createManagerServer(options) {
           ok: !!body.ok,
           listingUrl: body.listingUrl || null,
           message: body.message || null,
+          // 下架タスク専用: Yahoo で入札があり自動取消しを中止した印。
+          hasBids: !!body.hasBids,
           at: new Date().toISOString(),
           executedBy: reqNodeId,
         };

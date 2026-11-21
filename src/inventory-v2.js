@@ -10,10 +10,17 @@
 //     - 在庫やレコードがぶら下がっている状態は削除できない。
 //   出品レコード (listings.db): 1件のウェブサイト出品とのバインド。
 //     { _id, product_no, condition_id, platform, node_id, listing_id,
-//       listing_url, auto_restock, quota, sold_count, status, error,
-//       last_processed_sale_item_id, createdAt, updatedAt }
+//       listing_url, auto_restock, auto_delist, quota, sold_count, status,
+//       error, last_processed_sale_item_id, createdAt, updatedAt,
+//       listing_state, listed_at, state_at }
 //     - node_id は拡張が自動生成するノード ID。'' は「未割当（既定プール）」。
 //     - quota はこのレコードが売ってよい上限（null = 制限なし）。
+//     - auto_delist は自動下架の対象かどうか（レコード単位の opt-in）。
+//     - listing_state は出品ライフサイクル: 'live'（出品中）/ 'sold'
+//       （販売済み・補充待ち）/ 'unlisted'（未出品）/ 'unknown'（要確認）。
+//       確認済みイベントでのみ更新し、state_at にその時刻を持つ。
+//       listed_at は現在の出品が公開された時刻（下架の残存優先順位用）。
+//     - status は従来どおりレコードの健全性（'active' / 'error'）。
 //   ノード (nodes.db): { _id(=ノードID), name, firstSeenAt, lastSeenAt }
 //     - 表示名はここ（プログラム側）でのみ付け、重複は拒否する。
 //
@@ -143,16 +150,35 @@ function createInventoryV2(dbs) {
           listing_id: lid,
           listing_url: listingUrl(src.platform, lid),
           auto_restock: !!src.auto,
+          auto_delist: false,
           quota: null,
           sold_count: 0,
           status: src.err ? 'error' : 'active',
           error: src.err || null,
           last_processed_sale_item_id: src.last || null,
+          listing_state: 'live',
+          listed_at: new Date().toISOString(),
+          state_at: new Date().toISOString(),
           createdAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
         })
         stats.recordsCreated += 1
       }
+    }
+    // v0.2.12: 既存レコードへ出品状態フィールドを補完する（冪等）。
+    const allRecords = await find(listingsDb, {})
+    for (const r of allRecords) {
+      if (r.listing_state) continue
+      const at = r.updatedAt || r.createdAt || new Date().toISOString()
+      await update(listingsDb, { _id: r._id }, {
+        $set: {
+          listing_state: r.listing_id ? 'live' : 'unlisted',
+          listed_at: r.listing_id ? at : null,
+          state_at: at,
+          auto_delist: !!r.auto_delist,
+        },
+      })
+      stats.productsTouched += 1
     }
     return stats
   }
@@ -234,6 +260,7 @@ function createInventoryV2(dbs) {
     }
     const lid = parseListingId(platform, data.itemUrl || data.listing || data.listing_id || '')
     const autoRestock = !!(data && data.auto_restock)
+    const now = new Date().toISOString()
     if (!lid) {
       return { ok: false, error: '有効な商品 URL または商品 ID を入力してください。' }
     }
@@ -251,8 +278,14 @@ function createInventoryV2(dbs) {
         auto_restock: autoRestock,
         quota: data.quota != null && data.quota !== '' ? Math.max(0, Number(data.quota)) : null,
         node_id: data.node_id != null ? String(data.node_id) : rec.node_id || '',
-        updatedAt: new Date().toISOString(),
+        updatedAt: now,
       }
+      if (data.auto_delist !== undefined) $set.auto_delist = !!data.auto_delist
+      // 手で生きたリンクを結んだ = 出品中として扱う。ID が変わった場合は
+      // 出品時刻も付け替える（下架の残存優先順位は listed_at 基準）。
+      $set.listing_state = 'live'
+      $set.state_at = now
+      if (rec.listing_id !== lid || !rec.listed_at) $set.listed_at = now
       await update(listingsDb, { _id: data.id }, { $set })
       return { ok: true, listing: Object.assign({}, rec, $set) }
     }
@@ -269,13 +302,17 @@ function createInventoryV2(dbs) {
       listing_id: lid,
       listing_url: listingUrl(platform, lid),
       auto_restock: autoRestock,
+      auto_delist: !!(data && data.auto_delist),
       quota: data.quota != null && data.quota !== '' ? Math.max(0, Number(data.quota)) : null,
       sold_count: 0,
       status: 'active',
       error: null,
       last_processed_sale_item_id: null,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
+      listing_state: 'live',
+      listed_at: now,
+      state_at: now,
+      createdAt: now,
+      updatedAt: now,
     })
     return { ok: true, listing: rec }
   }

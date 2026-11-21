@@ -30,6 +30,7 @@ import { productImagePathFromRequest } from './utils/product-image'
 const { prepareUserDataDirectory } = require('./utils/user-data')
 const { createDatastores } = require('./main/datastores')
 const { createRelistTasks } = require('./main/relist-tasks')
+const { createDelist } = require('./main/delist')
 const { registerInventoryIpc } = require('./main/ipc-inventory')
 const { registerTaskIpc } = require('./main/ipc-tasks')
 
@@ -118,6 +119,8 @@ const ctx = {
   refreshRenderer,
   sendTaskList,
   sendInventoryMeta,
+  // 実体は初期化スコープ内で割り当てられる（無い間は無処理）。
+  persistTask: () => {},
 }
 
 // 再出品タスクまわりは src/main/relist-tasks.js へ分離。このファイル内では
@@ -134,6 +137,15 @@ const {
 ctx.platformBinding = platformBinding
 ctx.hasActiveRelistTask = hasActiveRelistTask
 ctx.createRelistTaskForRecord = createRelistTaskForRecord
+
+// 自動下架まわりは src/main/delist.js へ分離。
+const {
+  createDelistTaskForRecord,
+  ensureManualDelistEntry,
+  evaluateDelist,
+} = createDelist(ctx)
+ctx.createDelistTaskForRecord = createDelistTaskForRecord
+ctx.evaluateDelist = evaluateDelist
 
 // 商品データの変更後、レンダラが現在の検索条件で再取得できるよう通知する。
 function refreshRenderer() {
@@ -247,6 +259,7 @@ function startManagerServer() {
   const persistTask = (task) => {
     tasksDb.update({ id: task.id }, task, { upsert: true }, () => {})
   }
+  ctx.persistTask = persistTask
   // レコード紐付きタスクの結果をレコードへ反映する（v0.2.0）。
   // 成功時は実行ノードをレコードの担当として記録する（出生バインド）。
   // 既定状態のレコードは旧フィールドへも二重書きし、旧版へ戻しても
@@ -263,7 +276,14 @@ function startManagerServer() {
         // 旧 ID のままだと次の販売に一致しなくなる）。
         const listingUrl = normalizeYahooUrl(task.result.listingUrl) || record.listing_url
         const newListingId = listingUrl ? parseListingId('yahoo', listingUrl) : null
-        const patch = { error: null, status: 'active', node_id: bornNode }
+        const patch = {
+          error: null,
+          status: 'active',
+          node_id: bornNode,
+          listing_state: 'live',
+          listed_at: new Date().toISOString(),
+          state_at: new Date().toISOString(),
+        }
         if (newListingId) {
           patch.listing_id = newListingId
           patch.listing_url = listingUrl
@@ -302,6 +322,9 @@ function startManagerServer() {
         error: null,
         status: 'active',
         node_id: bornNode,
+        listing_state: 'live',
+        listed_at: new Date().toISOString(),
+        state_at: new Date().toISOString(),
       })
       if (isDefaultRecord) {
         db.update(
@@ -323,11 +346,73 @@ function startManagerServer() {
     }
   }
 
+  // 下架タスクの結果をレコードへ反映する。
+  // 成功: リンクは消えたので listing_id を外し「未出品」にする
+  // （listing_url は参照用に残す。再出品時は新しい ID が書き戻る）。
+  // 入札あり（Yahoo）: 出品は生きたまま。手動下架エントリを作る。
+  // その他の失敗: エラーを残す（出品は生きたまま）。
+  const applyDelistResultToRecord = async (task, record) => {
+    const bind = platformBinding(record.platform)
+    const isDefaultRecord = record.condition_id === defaultConditionId
+    const now = new Date().toISOString()
+    if (task.result && task.result.ok) {
+      await inventory.updateListing(record._id, {
+        listing_id: null,
+        listing_state: 'unlisted',
+        listed_at: null,
+        state_at: now,
+        error: null,
+        status: 'active',
+      })
+      if (isDefaultRecord) {
+        db.update(
+          { product_no: record.product_no },
+          { $set: { [bind.errorField]: null } },
+          () => refreshRenderer()
+        )
+      } else refreshRenderer()
+      return
+    }
+    if (task.result && task.result.hasBids) {
+      await inventory.updateListing(record._id, { state_at: now })
+      ensureManualDelistEntry({
+        product_no: record.product_no,
+        condition_id: record.condition_id,
+        record,
+        reason:
+          'Yahoo!オークションで入札があるため自動で取り消せませんでした。手動で対応してください。（' +
+          (record.listing_id || '') +
+          '）',
+      })
+      refreshRenderer()
+      return
+    }
+    const msg = (task.result && task.result.message) || '下架に失敗しました'
+    await inventory.updateListing(record._id, { error: msg, status: 'error', state_at: now })
+    if (isDefaultRecord) {
+      db.update(
+        { product_no: record.product_no },
+        { $set: { [bind.errorField]: msg } },
+        () => refreshRenderer()
+      )
+    } else refreshRenderer()
+  }
+
   // 再出品タスクの結果を受けたら、商品の参照 URL を新しい出品 URL で
   // 上書きする（成功時）。失敗時はエラー内容を商品に残し、自動では
   // 再試行しない（次は手動で出品し直す）。
   // v0.2.0: レコード紐付きタスクはレコードへ、それ以外は従来処理へ。
   const handleTaskResult = async (task) => {
+    if (inventory && task && task.type === 'delist' && task.listing_id) {
+      const record = await inventory.getListing(task.listing_id)
+      if (record) {
+        persistTask(task)
+        sendTaskList()
+        await applyDelistResultToRecord(task, record)
+        sendInventoryMeta()
+        return
+      }
+    }
     if (inventory && task && task.type === 'relist' && task.listing_id) {
       const record = await inventory.getListing(task.listing_id)
       if (record) {
@@ -452,6 +537,8 @@ function startManagerServer() {
           sold_count: newSoldCount,
           error: null,
           status: 'active',
+          listing_state: 'sold',
+          state_at: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
         },
       }
@@ -515,6 +602,13 @@ function startManagerServer() {
         console.warn('[manager] sale restock skipped:', e && e.message)
       }
     }
+    // 自動下架: 売却で在庫が減った結果、出品中リンク数が在庫を上回って
+    // いれば余剰分を下架する（在庫0でも走るのが要点）。
+    try {
+      await evaluateDelist(product.product_no, condId)
+    } catch (e) {
+      console.warn('[manager] delist evaluation skipped:', e && e.message)
+    }
     refreshRenderer()
     if (window && !window.isDestroyed()) {
       window.webContents.send('sale_reported', {
@@ -539,7 +633,12 @@ function startManagerServer() {
     if (!record) return { ok: true, assigned: false }
     if (record.node_id === claim.nodeId) return { ok: true, assigned: true, already: true }
     if (record.node_id) return { ok: true, assigned: false, conflict: true }
-    await inventory.updateListing(record._id, { node_id: claim.nodeId })
+    await inventory.updateListing(record._id, {
+      node_id: claim.nodeId,
+      listing_state: 'live',
+      listed_at: record.listed_at || new Date().toISOString(),
+      state_at: new Date().toISOString(),
+    })
     return { ok: true, assigned: true, product_no: record.product_no }
   }
 
@@ -916,6 +1015,23 @@ async function createWindow() {
       const newSoldNum = Number(product.selled_num || 0) + 1
       await dbUpdate(db, { product_no: product.product_no }, { $set: { condition_sold: soldMap, selled_num: newSoldNum } })
       refreshRenderer()
+      // 出品状態と自動下架: 売れたレコードが分かっていれば「販売済み」に
+      // し、下架判定は在庫0になったときこそ必要なので補充判定より先に走らせる。
+      if (inventory && data.record_id) {
+        await inventory
+          .updateListing(data.record_id, {
+            listing_state: 'sold',
+            state_at: new Date().toISOString(),
+          })
+          .catch(() => {})
+      }
+      if (inventory) {
+        try {
+          await evaluateDelist(product.product_no, condId)
+        } catch (e) {
+          console.warn('[manager] delist evaluation skipped:', e && e.message)
+        }
+      }
       // 自動補充: 手動の1件販売で売れた出品は1つだけ。指定されたレコード
       // （なければ、その状態の唯一のレコード）だけを補充する。
       if (!managerServer || !inventory) return

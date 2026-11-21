@@ -11,6 +11,7 @@
     recordsFor, recordsForCondition, conditionStock, conditionSold, stockedConditions,
     platformName, saveCondition, deleteConditionById, saveListing, deleteListingById,
     relistListing, claimListing, fixListingNode,
+    taskList,
   } from '../store';
   import { normalizeProductImageUrl } from '../utils/product-image'
 
@@ -322,10 +323,21 @@
   };
 
   // ---- 出品レコード編集モーダル ----
+  // 出品状態の表示名。出品中はタグに付けない（従来表示のまま）。
+  const LISTING_STATE_LABELS = { sold: '販売済', unlisted: '未出品', unknown: '要確認' };
+  const listingStateLabel = (r) =>
+    r && r.listing_state && r.listing_state !== 'live'
+      ? LISTING_STATE_LABELS[r.listing_state] || ''
+      : '';
+  // 手動下架の未処理エントリがある商品は行に印を出す。
+  const hasManualDelist = (productNo) =>
+    (taskList.value || []).some(
+      (t) => t.type === 'manual-delist' && t.status === 'manual' && t.product_no === productNo
+    );
   const listingEditFlag = ref(false);
   const listingEdit = reactive({
     id: null, product_no: '', condition_id: null, platform: 'mercari',
-    listing: '', node_id: '', auto_restock: true, quota: null,
+    listing: '', node_id: '', auto_restock: true, auto_delist: false, quota: null,
   });
   const openListingEdit = (record, conditionId) => {
     if (record) {
@@ -336,6 +348,7 @@
       listingEdit.listing = record.listing_url || record.listing_id || ''
       listingEdit.node_id = record.node_id || ''
       listingEdit.auto_restock = !!record.auto_restock
+      listingEdit.auto_delist = !!record.auto_delist
       listingEdit.quota = record.quota != null ? record.quota : null
     } else {
       listingEdit.id = null
@@ -345,6 +358,7 @@
       listingEdit.listing = ''
       listingEdit.node_id = ''
       listingEdit.auto_restock = true
+      listingEdit.auto_delist = false
       listingEdit.quota = null
     }
     listingEditFlag.value = true
@@ -358,6 +372,7 @@
       listing: listingEdit.listing,
       node_id: listingEdit.node_id || '',
       auto_restock: listingEdit.auto_restock,
+      auto_delist: listingEdit.auto_delist,
       quota: listingEdit.quota === '' ? null : listingEdit.quota,
     })
     listingEditFlag.value = false
@@ -497,7 +512,8 @@
               v-for="r in recordsFor(record.product_no)"
               :key="r._id"
               :color="r.error ? 'red' : (r.auto_restock ? 'green' : 'blue')"
-            >{{ platformName(r.platform) }}{{ r.error ? ' エラー' : (r.auto_restock ? ' 自動' : '') }}{{ r.node_id ? ' ·' + nodeLabel(r.node_id) : '' }}</a-tag>
+            >{{ platformName(r.platform) }}{{ r.error ? ' エラー' : (r.auto_restock ? ' 自動' : '') }}{{ listingStateLabel(r) ? ' ' + listingStateLabel(r) : '' }}{{ r.node_id ? ' ·' + nodeLabel(r.node_id) : '' }}</a-tag>
+            <a-tag v-if="hasManualDelist(record.product_no)" color="red">手動下架</a-tag>
           </template>
           <span v-else class="ref-none">未設定</span>
         </div>
@@ -568,6 +584,8 @@
             <a class="link" @click="urlClick(r.listing_url)">{{ r.listing_id }}</a>
             <span class="rec-meta">ノード：{{ nodeLabel(r.node_id) }}</span>
             <span class="rec-meta">自動補充：{{ r.auto_restock ? 'ON' : 'OFF' }}</span>
+            <span class="rec-meta">自動下架：{{ r.auto_delist ? 'ON' : 'OFF' }}</span>
+            <span class="rec-meta">状態：{{ listingStateLabel(r) || '出品中' }}{{ r.state_at ? '（' + String(r.state_at).slice(0, 16).replace('T', ' ') + ' 確認）' : '' }}</span>
             <span class="rec-meta">配額：{{ r.quota != null ? r.quota : '無制限' }}（販売 {{ r.sold_count || 0 }}）</span>
           </div>
           <div v-if="r.error" class="rec-error">エラー：{{ r.error }}</div>
@@ -645,6 +663,10 @@
       </a-form-item>
       <a-form-item label="自動補充">
         <a-switch v-model:checked="listingEdit.auto_restock" />
+      </a-form-item>
+      <a-form-item label="自動下架">
+        <a-switch v-model:checked="listingEdit.auto_delist" />
+        <span style="margin-left: 8px; color: #8a919c; font-size: 12px;">在庫より出品が多くなったら古い順に自動で下架（メルカリは削除 / ヤフオクは取消し、入札時は手動）</span>
       </a-form-item>
       <a-form-item label="配額（このレコードが売れる上限、空欄＝無制限）">
         <a-input-number v-model:value="listingEdit.quota" style="width: 100%" :min="0" placeholder="無制限" />
