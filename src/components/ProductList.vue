@@ -596,7 +596,7 @@
               :disabled="conditionStock(refDetailProduct, cond._id) <= 0"
               @click="relistListing(r._id)"
             >補充出品</a-button>
-            <a-button v-if="!r.node_id" size="small" @click="claimListing(r._id)">所有権を確認</a-button>
+            <a-button v-if="!r.node_id || (r.listing_id && r.listing_state !== 'live')" size="small" @click="claimListing(r._id)">所有権を確認</a-button>
             <a-select
               size="small"
               style="width: 170px"
