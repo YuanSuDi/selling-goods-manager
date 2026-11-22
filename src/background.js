@@ -420,6 +420,17 @@ function startManagerServer() {
         sendTaskList()
         await applyTaskResultToRecord(task, record)
         sendInventoryMeta()
+        // 再出品で新しい出品が増えた直後も下架判定を走らせる。在庫が
+        // 既に尽きている商品に後から出品レコードが生まれた場合、売却
+        // イベントは二度と来ないため、ここで判定しないと余剰出品が
+        // 永遠に残る（A342 のメルカリ側の漏れ）。
+        if (task.result && task.result.ok) {
+          try {
+            await evaluateDelist(record.product_no, record.condition_id)
+          } catch (e) {
+            console.warn('[manager] delist evaluation after relist skipped:', e && e.message)
+          }
+        }
         return
       }
     }
@@ -528,20 +539,27 @@ function startManagerServer() {
 
     // レコード側の原子的ガード（スキャン多重報告・競合対策）。
     const newSoldCount = Number(record.sold_count || 0) + 1
+    // 状態を「販売済」にできるのは、売れたリンクがレコードの現在の
+    // リンクそのものの場合だけ。再出品で新しい ID に差し替わった
+    // レコードへ旧リンクの売却を被せると、出品中のリンクが「販売済」
+    // 扱いになって下架判定から消える（A342 の不具合）。ID が違う場合は
+    // 記帳（在庫・販売数・重複防止マーカー）だけを行い、状態は触らない。
+    const isCurrentListing = String(record.listing_id || '') === itemId
+    const saleSet = {
+      last_processed_sale_item_id: itemId,
+      sold_count: newSoldCount,
+      error: null,
+      status: 'active',
+      updatedAt: new Date().toISOString(),
+    }
+    if (isCurrentListing) {
+      saleSet.listing_state = 'sold'
+      saleSet.state_at = new Date().toISOString()
+    }
     const guard = await dbUpdate(
       listingsDb,
       { _id: record._id, last_processed_sale_item_id: { $ne: itemId } },
-      {
-        $set: {
-          last_processed_sale_item_id: itemId,
-          sold_count: newSoldCount,
-          error: null,
-          status: 'active',
-          listing_state: 'sold',
-          state_at: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-        },
-      }
+      { $set: saleSet }
     )
     if (!guard) {
       return { ok: true, matched: true, duplicate: true, itemId, product_no: product.product_no }
@@ -595,7 +613,9 @@ function startManagerServer() {
     }
 
     const quotaOk = record.quota == null || newSoldCount < Number(record.quota)
-    if (newCondStock > 0 && record.auto_restock && quotaOk) {
+    // 補充も「現在のリンクが売れた」場合だけ。旧リンクの売却で補充すると、
+    // 生きている現在のリンクと二重出品になる。
+    if (isCurrentListing && newCondStock > 0 && record.auto_restock && quotaOk) {
       try {
         createRelistTaskForRecord(updatedRecord, true, platform === 'yahoo' ? 'yahoo-sold' : 'mercari-todo')
       } catch (e) {
@@ -631,7 +651,24 @@ function startManagerServer() {
     if (!inventory || !claim || !claim.nodeId) return { ok: false, assigned: false }
     const record = await inventory.findRecordByListingId(claim.platform, claim.listingId)
     if (!record) return { ok: true, assigned: false }
-    if (record.node_id === claim.nodeId) return { ok: true, assigned: true, already: true }
+    if (record.node_id === claim.nodeId) {
+      // 担当ノード本人が「出品中リストで見た」と申告してきた時点で、
+      // そのリンクが生きている証拠になる。状態が「販売済」等に
+      // ズレていたら「出品中」へ戻し、下架判定も走らせておく
+      // （A342 のように誤って販売済になったレコードの自己修復）。
+      if (record.listing_state !== 'live') {
+        await inventory.updateListing(record._id, {
+          listing_state: 'live',
+          state_at: new Date().toISOString(),
+        })
+        try {
+          await evaluateDelist(record.product_no, record.condition_id)
+        } catch (e) {
+          console.warn('[manager] delist evaluation after claim skipped:', e && e.message)
+        }
+      }
+      return { ok: true, assigned: true, already: true }
+    }
     if (record.node_id) return { ok: true, assigned: false, conflict: true }
     await inventory.updateListing(record._id, {
       node_id: claim.nodeId,
@@ -639,6 +676,11 @@ function startManagerServer() {
       listed_at: record.listed_at || new Date().toISOString(),
       state_at: new Date().toISOString(),
     })
+    try {
+      await evaluateDelist(record.product_no, record.condition_id)
+    } catch (e) {
+      console.warn('[manager] delist evaluation after claim skipped:', e && e.message)
+    }
     return { ok: true, assigned: true, product_no: record.product_no }
   }
 
