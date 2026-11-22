@@ -19,7 +19,15 @@ function createDelist(ctx) {
     const busy = new Set()
     if (!ctx.managerServer) return busy
     for (const t of ctx.managerServer.tasks.values()) {
-      if ((t.status === 'pending' || t.status === 'running') && t.listing_id) {
+      // 「作業中」とみなすのは出品そのものを変えるタスクだけ。
+      // 所有権確認（verify）は読み取り専用の探査なので、これが
+      // pending だという理由で下架対象から外すと、確認をきっかけに
+      // 走った下架判定が自分自身にブロックされる（A342 で発生）。
+      if (
+        (t.type === 'relist' || t.type === 'delist') &&
+        (t.status === 'pending' || t.status === 'running') &&
+        t.listing_id
+      ) {
         busy.add(t.listing_id)
       }
     }

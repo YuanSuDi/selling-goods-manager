@@ -657,18 +657,19 @@ function startManagerServer() {
     if (record.node_id === claim.nodeId) {
       // 担当ノード本人が「出品中リストで見た」と申告してきた時点で、
       // そのリンクが生きている証拠になる。状態が「販売済」等に
-      // ズレていたら「出品中」へ戻し、下架判定も走らせておく
-      // （A342 のように誤って販売済になったレコードの自己修復）。
+      // ズレていたら「出品中」へ戻す。下架判定は状態が既に合って
+      // いても毎回走らせる（前回の判定が手動エントリに化けた後の
+      // 再クリック＝再判定の受け皿にするため）。
       if (record.listing_state !== 'live') {
         await inventory.updateListing(record._id, {
           listing_state: 'live',
           state_at: new Date().toISOString(),
         })
-        try {
-          await evaluateDelist(record.product_no, record.condition_id)
-        } catch (e) {
-          console.warn('[manager] delist evaluation after claim skipped:', e && e.message)
-        }
+      }
+      try {
+        await evaluateDelist(record.product_no, record.condition_id)
+      } catch (e) {
+        console.warn('[manager] delist evaluation after claim skipped:', e && e.message)
       }
       return { ok: true, assigned: true, already: true }
     }
