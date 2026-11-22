@@ -529,67 +529,109 @@
     }
   }
 
-  // 配送方法ラジオ（name="shipmethod_dummy"）を名称で選ぶ。ラジオ自体からは
-  // 名称が読み取りにくい構造なので、方法名で始まる小さな表示要素を探して
-  // その行ごとクリックし、ラジオの checked で検証する。名称が完全に一致する
-  // 要素を優先し、候補が複数名称にまたがる場合は選ばない（誤選択防止）。
-  function selectShipMethod(method) {
+  // 配送方法を名称で選ぶ。実フォームの実測（2026-11-22 夜）:
+  //   - おてがる配送のカードは radio とテキストが同居するだけで <label> が
+  //     無い。カードの div へ合成イベントを送っても radio は切り替わらない
+  //     （Mercari で実証済みの法則: ラジオは要素自身の native click でしか
+  //     切り替わらない）。見つけた radio 自身を click するのが本命。
+  //   - ゆうパケット と ゆうパケットポスト は「1 つのカード = 1 つの
+  //     radio」の合体カード（ユーザー指摘の落とし穴）。カード名義は
+  //     先頭の ゆうパケット で、後半に ゆうパケットポスト も同居する。
+  //     逆に ゆうパケットポストmini は別カードなので、前方一致だけで
+  //     選ぶと mini を誤選択する。照合は 完全一致 → 合体カード → 前方
+  //     一致（曖昧なら不選択）の順に格付けする。
+  //   - 可視カードに無ければ「その他の配送方法」を 1 回だけ開いて探し直す。
+  async function selectShipMethod(method) {
     const norm = (s) =>
       String(s || "").replace(/[\s　]/g, "").replace(/（EAZY）|\(EAZY\)/gi, "");
     const target = norm(method);
     if (!target) return false;
-    const radios = Array.from(
-      document.querySelectorAll('input[type="radio"][name="shipmethod_dummy"]')
-    );
-    if (!radios.length) return false;
-    const wasChecked = radios.map((r) => r.checked);
     const namePartOf = (el) =>
       norm(
         ((el.innerText || el.textContent || "").replace(/\s+/g, " ").trim()).split(
           /全国一律|円/
         )[0]
       );
-    const all = Array.from(document.querySelectorAll("label, div, span, td, li, a"))
-      .filter((el) => {
-        if (!FF.isVisible(el)) return false;
-        const t = (el.innerText || "").replace(/\s+/g, " ").trim();
-        if (!t || t.length > 90) return false;
-        const np = namePartOf(el);
-        return np === target || np.startsWith(target);
-      })
-      .sort((a, b) => (a.innerText || "").length - (b.innerText || "").length);
-    const exact = all.filter((el) => namePartOf(el) === target);
-    let pool = exact.length ? exact : all;
-    if (!exact.length) {
-      const distinct = new Set(pool.map((el) => namePartOf(el)));
-      if (distinct.size !== 1) {
+    const fullTextOf = (el) =>
+      norm((el.innerText || el.textContent || "").replace(/\s+/g, " "));
+    // 要素から上へ辿り、radio をちょうど 1 つ含む最小の祖先とその radio。
+    // 0 → 複数へ跳ぶ祖先しか無ければ null（カード単位で掴めない）。
+    const singleRadioRow = (el) => {
+      for (let n = el; n && n !== document.body; n = n.parentElement) {
+        if (!n.querySelectorAll) continue;
+        const rs = n.querySelectorAll('input[type="radio"]');
+        if (rs.length === 1) return { row: n, radio: rs[0] };
+        if (rs.length > 1) return null;
+      }
+      return null;
+    };
+    const coordClick = (el) => {
+      try {
+        const r = el.getBoundingClientRect();
+        const x = r.left + r.width / 2;
+        const y = r.top + r.height / 2;
+        const t = document.elementFromPoint(x, y) || el;
+        const opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 };
+        for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+          t.dispatchEvent(new MouseEvent(type, opts));
+        }
+      } catch (e) { /* 次の手段へ */ }
+    };
+    const trySelect = (el) => {
+      const found = singleRadioRow(el);
+      if (!found) return false;
+      const { row, radio } = found;
+      try { radio.click(); } catch (e) { /* 次の手段へ */ }
+      if (radio.checked) return true;
+      FF.clickLikeUser(row);
+      if (radio.checked) return true;
+      coordClick(radio);
+      if (radio.checked) return true;
+      FF.clickLikeUser(el);
+      return radio.checked;
+    };
+    const collectCandidates = () => {
+      const els = Array.from(document.querySelectorAll("label, div, span, td, li, a"))
+        .filter((el) => {
+          if (!FF.isVisible(el)) return false;
+          const t = (el.innerText || "").replace(/\s+/g, " ").trim();
+          return t && t.length <= 90;
+        })
+        .sort((a, b) => (a.innerText || "").length - (b.innerText || "").length);
+      const exact = els.filter((el) => namePartOf(el) === target);
+      if (exact.length) return exact;
+      // 合体カード: 名義は前方一致で、カード全文に対象名が同居している。
+      const combined = els.filter(
+        (el) =>
+          namePartOf(el) &&
+          target.startsWith(namePartOf(el)) &&
+          namePartOf(el).length < target.length &&
+          fullTextOf(el).includes(target)
+      );
+      if (combined.length) return combined;
+      const prefix = els.filter((el) => namePartOf(el).startsWith(target));
+      const distinct = new Set(prefix.map((el) => namePartOf(el)));
+      if (distinct.size === 1) return prefix;
+      if (distinct.size > 1) {
         console.log("[FurimaCopy] ship method ambiguous:", Array.from(distinct), "for", method);
-        return false;
+      }
+      return [];
+    };
+    let pool = collectCandidates();
+    if (!pool.length) {
+      // 「その他の配送方法」が閉じていたら 1 回だけ開いて探し直す。
+      const expander = Array.from(document.querySelectorAll("a, button, div, span"))
+        .filter((el) => FF.isVisible(el))
+        .find((el) => norm(el.innerText || el.textContent || "") === "その他の配送方法");
+      if (expander) {
+        FF.clickLikeUser(expander);
+        // 展開アニメーション/描画を待ってから探し直す
+        await FF.waitFor(() => collectCandidates().length || null, 3000, 250);
+        pool = collectCandidates();
       }
     }
     for (const el of pool) {
-      // その要素を含む「ラジオ 1 つだけの行」をクリック対象にする。
-      let row = el;
-      for (let n = el; n && n !== document.body; n = n.parentElement) {
-        if (
-          n.querySelectorAll &&
-          n.querySelectorAll('input[name="shipmethod_dummy"]').length === 1
-        ) {
-          row = n;
-          break;
-        }
-      }
-      FF.clickLikeUser(row);
-      const nowChecked = radios.filter((r) => r.checked);
-      if (nowChecked.length === 1) {
-        const rowRadios = row.querySelectorAll
-          ? row.querySelectorAll('input[name="shipmethod_dummy"]')
-          : [];
-        if (rowRadios.length === 1 && rowRadios[0].checked) return true;
-        // 行とラジオを対応付けできない場合は、このクリックで新たに
-        // チェックが付いたこと自体を根拠にする。
-        if (!wasChecked[radios.indexOf(nowChecked[0])]) return true;
-      }
+      if (trySelect(el)) return true;
     }
     return false;
   }
@@ -755,7 +797,7 @@
     ) {
       if (data.shippingMethod) {
         shipHandled = true;
-        const ok = selectShipMethod(data.shippingMethod);
+        const ok = await selectShipMethod(data.shippingMethod);
         lines.push({
           label: "配送方法",
           status: ok ? "ok" : "fail",
