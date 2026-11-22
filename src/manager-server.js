@@ -12,6 +12,8 @@
 // API:
 //   GET  /api/ping                 疎通確認
 //   GET  /api/tasks?status=pending 未実行タスク一覧（拡張がポーリングする）
+//   ping / tasks の応答には extVersion（配置済みの同梱拡張の版、v0.2.18）が
+//   載る。拡張は自版より新しければ空き時間に自己再読み込みする（v0.12.30）。
 //   POST /api/tasks                タスク作成（プログラムの UI から）
 //   POST /api/tasks/:id/claim      拡張が実行開始を宣言（二重実行防止）
 //   POST /api/tasks/:id/result     拡張が結果を報告 { ok, listingUrl?, message? }
@@ -61,6 +63,14 @@ function createManagerServer(options) {
   const getNodeInfo = typeof opts.getNodeInfo === "function" ? opts.getNodeInfo : null;
   const onOwnershipClaim = typeof opts.onOwnershipClaim === "function" ? opts.onOwnershipClaim : null;
   const onTaskReleased = typeof opts.onTaskReleased === "function" ? opts.onTaskReleased : null;
+  const getExtVersion = typeof opts.getExtVersion === "function" ? opts.getExtVersion : null;
+  const extVersion = () => {
+    try {
+      return getExtVersion ? getExtVersion() : null;
+    } catch (e) {
+      return null;
+    }
+  };
 
   const tasks = new Map();
   const taskImagePaths = new Set();
@@ -218,7 +228,7 @@ function createManagerServer(options) {
       }
 
       if (req.method === "GET" && pathname === "/api/ping") {
-        return sendJson(res, 200, { ok: true, app: "selling-goods-manager", version: 2, node: nodePayload(reqNodeId) });
+        return sendJson(res, 200, { ok: true, app: "selling-goods-manager", version: 2, extVersion: extVersion(), node: nodePayload(reqNodeId) });
       }
 
       if (req.method === "GET" && pathname === "/api/tasks") {
@@ -229,7 +239,7 @@ function createManagerServer(options) {
         if (!status || status === "pending") {
           list = list.filter((t) => taskVisibleTo(t, reqNodeId));
         }
-        return sendJson(res, 200, { ok: true, tasks: list, node: nodePayload(reqNodeId) });
+        return sendJson(res, 200, { ok: true, tasks: list, extVersion: extVersion(), node: nodePayload(reqNodeId) });
       }
 
       if (req.method === "POST" && pathname === "/api/tasks") {

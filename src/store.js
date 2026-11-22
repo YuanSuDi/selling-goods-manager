@@ -380,6 +380,9 @@ export const mgrInfo = ref({})
 export const showManagerInfo = () => {
   ipc.send('get_manager_info')
 }
+export const saveExtDeployPaths = (paths) => {
+  ipc.send('set_ext_deploy_paths', paths)
+}
 ipc.on('manager_info', (e, info) => {
   mgrInfo.value = info || {}
   mgrInfoFlag.value = true

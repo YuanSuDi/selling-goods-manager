@@ -1,0 +1,838 @@
+// fillers/sell-yahoo.js
+// Yahoo!オークション出品ページ（https://auctions.yahoo.co.jp/jp/show/submit）に、
+// ステージング中のコピーデータをフォームへ入力する。
+// 従来型の長いフォーム:
+//   - タイトル / 開始価格 は自動入力（希望落札価格は手動）
+//   - 説明欄はリッチテキストエディタで、実体が子 iframe 内にあることがあるため、
+//     トップフレームで見つからなければ各 iframe に入力を依頼する（下記 message 連携）
+//   - 画像は単体 input[type=file] が複数並ぶ形式 → lib/fill.js が 1 枚ずつ配る
+//   - 商品の状態はネイティブ <select> のテキスト一致を試す
+//   - 配送（方法・負担・発送元・日数）は、コピー元が Yahoo! で構造化データが
+//     取れている場合に自動選択を試す（v0.12.6）
+//   - カテゴリは選択ページ（topsubmit）へ遷移して自動選択する（v0.12.6）:
+//     フォーム側で保留データを置いて「選択する」を押し、topsubmit 側の
+//     ドライバがパスを選んで確定する。主ルートは「リストから選択する」の
+//     ツリー逐次選択（v0.12.28、実測で確定した確実な経路）。キーワード
+//     検索＋完全一致はフォールバック（Yahoo! の検索索引に載らない
+//     カテゴリがあり、確率で失敗するため主ルートにしない）
+//   - 説明文は入力後に編集欄を読み戻し、文字数で検証してから OK とする
+// 送信・出品ボタンは絶対に押さない。
+(() => {
+  "use strict";
+  const FC = window.FurimaCopy;
+  const FF = window.FurimaFill;
+  if (!FC || !FF) return;
+
+  const VERSION = chrome.runtime.getManifest().version;
+  console.log("[FurimaCopy] yahoo sell filler active: v" + VERSION, location.href);
+
+  // ---- カテゴリ選択ページ（topsubmit）での自動選択ドライバ -------------------
+  // 出品フォームの「選択する」を押すと topsubmit へ遷移する。フォーム側が
+  // 保留データ（fcYahooCategoryPending）を置いてから遷移してくるので、ここでは
+  // キーワード検索で完全一致するカテゴリパスを選んで「このカテゴリに出品」を押す。
+  // 保留データが無い（手動で開いた）場合は何もしない。
+  const CATEGORY_PENDING_KEY = "fcYahooCategoryPending";
+
+  function pickerNote(msg) {
+    try {
+      const d = document.createElement("div");
+      d.style.cssText =
+        "position:fixed;top:16px;right:16px;z-index:2147483647;background:#fff;color:#222;" +
+        "border:1px solid #ddd;border-radius:10px;box-shadow:0 8px 28px rgba(0,0,0,0.28);" +
+        "padding:12px 14px;font-size:13px;line-height:1.55;max-width:330px;";
+      d.textContent = msg;
+      document.body.appendChild(d);
+    } catch (e) {
+      /* 表示できなくても処理は止めない */
+    }
+  }
+
+  async function runYahooCategoryPicker() {
+    let pending = null;
+    try {
+      const res = await chrome.storage.local.get(CATEGORY_PENDING_KEY);
+      pending = res[CATEGORY_PENDING_KEY] || null;
+    } catch (e) {
+      /* 読めなければ手動操作の邪魔をしない */
+    }
+    if (!pending || !Array.isArray(pending.segments) || !pending.segments.length) return;
+    if (Date.now() - (pending.at || 0) > 10 * 60 * 1000) return; // 古い指示は無視
+    const segments = pending.segments.map((s) => String(s).trim()).filter(Boolean);
+    const leaf = segments[segments.length - 1];
+    const savePending = async (patch) => {
+      pending = Object.assign({}, pending, patch);
+      try {
+        await chrome.storage.local.set({ [CATEGORY_PENDING_KEY]: pending });
+      } catch (e) {
+        /* noop */
+      }
+    };
+    const fail = async (msg) => {
+      try {
+        await chrome.storage.local.remove(CATEGORY_PENDING_KEY);
+      } catch (e) {
+        /* noop */
+      }
+      pickerNote("カテゴリの自動選択に失敗しました：" + msg + "（手動で選択してください）");
+      console.warn("[FurimaCopy] yahoo category picker failed:", msg);
+    };
+    // 候補ラベルのパス文字列 → セグメント列。
+    // 実ページの候補は「オークション > … > ケース（出品されている商品）」形式。
+    const normSegs = (text) =>
+      String(text || "")
+        .replace(/（?出品されている商品）?/g, "")
+        .split(">")
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .filter((s) => s !== "オークション" && s !== "オークショントップ");
+    const findHit = () => {
+      for (const lab of Array.from(document.querySelectorAll("label"))) {
+        const segs = normSegs(lab.textContent);
+        if (
+          segs.length === segments.length &&
+          segs.every((s, i) => s === segments[i])
+        ) {
+          const radio =
+            lab.querySelector('input[type="radio"]') ||
+            (lab.htmlFor ? document.getElementById(lab.htmlFor) : null);
+          if (radio) return { lab, radio };
+        }
+      }
+      return null;
+    };
+    const hasResults = () =>
+      Array.from(document.querySelectorAll("label")).some((lab) =>
+        lab.querySelector('input[type="radio"]')
+      );
+    const labelsSignature = () =>
+      Array.from(document.querySelectorAll("label"))
+        .map((lab) => FF.normalizeText(lab.textContent || ""))
+        .join("|")
+        .slice(0, 400);
+    const clickConfirmButton = async () => {
+      const confirmBtn = await FF.waitFor(() => {
+        const btns = Array.from(
+          document.querySelectorAll('button, input[type="submit"], input[type="button"]')
+        ).filter(
+          (b) =>
+            FF.isVisible(b) &&
+            !b.disabled &&
+            FF.normalizeText(b.textContent || b.value || "").includes("このカテゴリに出品")
+        );
+        return btns[0] || null;
+      }, 6000, 250);
+      if (!confirmBtn) return false;
+      FF.clickLikeUser(confirmBtn);
+      return true;
+    };
+    const selectHit = async (hit) => {
+      FF.clickLikeUser(hit.lab);
+      if (!hit.radio.checked) {
+        try { hit.radio.click(); } catch (e) { /* 下で検証する */ }
+      }
+      if (!hit.radio.checked) return fail("カテゴリのラジオを選択できませんでした");
+      if (!(await clickConfirmButton())) {
+        return fail("確定ボタン（このカテゴリに出品）が見つかりませんでした");
+      }
+      // 成功時は保留データを残す。フォーム側が実際の選択と照合して消す。
+    };
+    // ---- 主ルート: 「リストから選択する」のツリーをパス通り辿る（v0.12.28） ----
+    // 実測（2026-11-22）: 左→右に列が増える逐次展開 UI。子ありは右端に「>」、
+    // 一部カテゴリ名は末尾に「@」装飾。下部「選択したカテゴリ」に現在の
+    // パスが「>」連結で表示される。葉を押すと「このカテゴリに出品」が出る。
+    // キーワード検索は Yahoo! 側の索引に載らないカテゴリがあり確率で失敗
+    // するため、ツリーを主ルート、検索をフォールバックにする。
+    const cleanEntryText = (t) =>
+      FF.normalizeText(t || "").replace(/[>＞@]\s*$/g, "").trim();
+    const findTreeEntry = (name) => {
+      const cands = Array.from(
+        document.querySelectorAll('a, button, li, [role="button"], [role="option"]')
+      ).filter((el) => FF.isVisible(el) && cleanEntryText(el.textContent) === name);
+      return cands[0] || null;
+    };
+    const selectedPathShown = (upto) => {
+      const want = segments.slice(0, upto + 1).join(">");
+      const els = Array.from(document.querySelectorAll("div, p, span, td, dd, li"));
+      return els.some((el) => {
+        const t = FF.normalizeText(el.textContent || "").replace(/\s*>\s*/g, ">");
+        return t === want || t.endsWith(">" + want) || t.includes("選択したカテゴリ") && t.includes(want);
+      });
+    };
+    const drillDown = async () => {
+      const tab = await FF.waitFor(() => {
+        const tabs = Array.from(document.querySelectorAll('a, button, li, [role="tab"]')).filter(
+          (el) => FF.isVisible(el) && FF.normalizeText(el.textContent || "") === "リストから選択する"
+        );
+        return tabs[0] || null;
+      }, 8000, 250);
+      if (!tab) return false;
+      FF.clickLikeUser(tab);
+      for (let i = 0; i < segments.length; i++) {
+        const entry = await FF.waitFor(() => findTreeEntry(segments[i]), 9000, 300);
+        if (!entry) return false;
+        FF.clickLikeUser(entry);
+        // 効いていなければネイティブ click でもう一度だけ試す
+        const okPath = await FF.waitFor(
+          () => (selectedPathShown(i) ? true : null),
+          2500,
+          250
+        );
+        if (!okPath) {
+          try { entry.click(); } catch (e) { /* 次の検証に委ねる */ }
+          await FF.waitFor(() => (selectedPathShown(i) ? true : null), 2500, 250);
+        }
+      }
+      // 葉まで辿れたら確定ボタンが出るはず
+      return clickConfirmButton();
+    };
+    try {
+      // まず現在表示中の検索候補から探す（検索済みの再実行・遷移後の継続）。
+      let hit = findHit();
+      if (hit) return selectHit(hit);
+
+      // 主ルート: ツリー逐次選択
+      if (await drillDown()) return;
+      // ツリーで途中まで進んだ場合に備え、状態を検索モード側へ寄せ直すため
+      // キーワードタブへ戻ってからフォールバックする。
+      const kwTab = Array.from(document.querySelectorAll('a, button, li, [role="tab"]')).find(
+        (el) => FF.isVisible(el) && FF.normalizeText(el.textContent || "").startsWith("キーワードから選択する")
+      );
+      if (kwTab) FF.clickLikeUser(kwTab);
+
+      if (!hasResults()) {
+        // キーワード検索の入力欄と「検 索」ボタンを、同じ塊の中から探す。
+        // ページ上部のサイト内検索と取り違えないよう、タイトルがプリフィル
+        // されている欄（＝カテゴリ検索）を最優先し、次にセレクトボックスを
+        // 同じ塊に持つものを選ぶ。
+        const pair = await FF.waitFor(() => {
+          const btns = Array.from(
+            document.querySelectorAll('button, input[type="submit"], input[type="button"]')
+          ).filter(
+            (b) => FF.isVisible(b) && FF.normalizeText(b.textContent || b.value || "") === "検索"
+          );
+          const found = [];
+          for (const b of btns) {
+            let box = b;
+            for (let i = 0; i < 6 && box; i++) {
+              box = box.parentElement;
+              if (!box) break;
+              const input = box.querySelector('input[type="text"], input:not([type])');
+              if (input && FF.isVisible(input)) {
+                found.push({ input, btn: b, box });
+                break;
+              }
+            }
+          }
+          if (!found.length) return null;
+          const prefilled = found.find((f) => (f.input.value || "").trim().length > 0);
+          if (prefilled) return prefilled;
+          const withSelect = found.find((f) => f.box.querySelector("select"));
+          return withSelect || found[0];
+        }, 8000, 250);
+        if (!pair) return fail("カテゴリ検索欄が見つかりませんでした");
+        // 大分類セレクトは触らない（v0.12.27 の絞り込みは、索引に無い
+        // カテゴリを結果から消してしまう副作用が実測で判明したため廃止）。
+        if ((pair.input.value || "").trim() !== leaf) {
+          FF.setNativeValue(pair.input, leaf);
+          pair.input.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+        await savePending({ searched: true });
+        FF.clickLikeUser(pair.btn);
+        // 結果の出現を待つ。検索がページ遷移なら本実行はここで終わり、
+        // 遷移先で再実行されたドライバが表示中の候補から続きを拾う。
+        const ready = await FF.waitFor(() => (hasResults() ? true : null), 12000, 300);
+        if (!ready) {
+          if (pending.searched) {
+            return fail("候補に一致するカテゴリがありませんでした（" + (pending.path || leaf) + "）");
+          }
+          return; // 遷移中とみなし、次回実行に委ねる
+        }
+        hit = findHit();
+        if (hit) return selectHit(hit);
+      }
+
+      // 表示中の候補に無ければ「次の10件」でページを送りながら探す（最大10回）。
+      for (let i = 0; i < 10; i++) {
+        if ((pending.paged || 0) >= 10) break;
+        const next = Array.from(document.querySelectorAll("a, button")).find(
+          (a) => FF.isVisible(a) && FF.normalizeText(a.textContent || "") === "次の10件"
+        );
+        if (!next) break;
+        const beforeSig = labelsSignature();
+        await savePending({ paged: (pending.paged || 0) + 1 });
+        FF.clickLikeUser(next);
+        // AJAX 差し替えならラベル集合が変わる。ページ遷移なら再実行側が拾う。
+        const changed = await FF.waitFor(
+          () => (labelsSignature() !== beforeSig ? true : null),
+          6000,
+          300
+        );
+        if (!changed) break;
+        hit = findHit();
+        if (hit) return selectHit(hit);
+      }
+      return fail("候補に一致するカテゴリがありませんでした（" + (pending.path || leaf) + "）");
+    } catch (e) {
+      await fail(String((e && e.message) || e));
+    }
+  }
+
+  if (/topsubmit/.test(location.pathname)) {
+    runYahooCategoryPicker();
+    return;
+  }
+
+  // ---- 説明文の入力 ---------------------------------------------------------------
+  // Yahoo! の説明欄は RTE（リッチテキストエディタ）で、構造は実測で判明している:
+  //   編集実体: #descriptionArea 内の iframe（id="rteEditorComposition*", about:blank）の body
+  //   送信先:   hidden input 群（Description / Description_rte / Description_rte_work /
+  //             Description_plain）。送信時にエディタ body から再同期される想定だが、
+  //             保険として隠しフィールドにも同じ内容を入れておく。
+  // 戻り値は入力経路のコード（false = 失敗）。パネルの注記に使う。
+  function escapeHtml(s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  function syncHiddenDescription(html, plain) {
+    const set = (id, v) => {
+      const el = document.getElementById(id);
+      if (el) el.value = v == null ? "" : v;
+    };
+    set("Description_rte", html);
+    set("Description_rte_work", html);
+    set("Description", html);
+    set("Description_plain", plain);
+  }
+
+  // html が渡された場合（Yahoo!→Yahoo! で書式ごとコピーできる場合）はそれをそのまま
+  // 編集領域へ入れ、隠しフィールドの plain 側にはプレーンテキスト版を同期する。
+  function fillDescriptionInEditorIframe(value, html) {
+    if (window !== window.top) return false;
+    const frames = Array.from(document.querySelectorAll("iframe"));
+    const inDescArea = frames.filter((f) => f.closest("#descriptionArea"));
+    const rteLike = frames.filter((f) => /rte|editor/i.test(f.id || ""));
+    const targets = inDescArea.length ? inDescArea : rteLike;
+    for (const f of targets) {
+      let doc = null;
+      try {
+        doc = f.contentDocument;
+      } catch (e) {
+        doc = null; // クロスオリジンで触れないフレームは対象外
+      }
+      if (!doc || !doc.body) continue;
+      try {
+        const bodyHtml = html || escapeHtml(value).replace(/\n/g, "<br>");
+        doc.body.innerHTML = bodyHtml;
+        doc.body.dispatchEvent(new Event("input", { bubbles: true }));
+        doc.body.dispatchEvent(new Event("keyup", { bubbles: true }));
+        doc.dispatchEvent(new Event("input", { bubbles: true }));
+        syncHiddenDescription(bodyHtml, value);
+        console.log(
+          "[FurimaCopy] description -> editor iframe body",
+          f.id || "(no id)",
+          html ? "(html)" : "(text)"
+        );
+        return true;
+      } catch (e) {
+        console.warn("[FurimaCopy] editor iframe write failed", e);
+      }
+    }
+    return false;
+  }
+
+  // このフレーム内で説明文の入力を試す。汎用 fillText のラベル探索は
+  // 別セクションの入力欄（製品検索など）を誤爆した実績があるため使わない。
+  function fillDescriptionLocal(value, html) {
+    if (!value && !html) return false;
+    // 0) RTE の iframe 本体（Yahoo! の実構造）。HTML はこの経路でのみ使う。
+    if (fillDescriptionInEditorIframe(value, html)) return html ? "editor-iframe-html" : "editor-iframe";
+    // 1) 見えている textarea（name / id が説明系のものだけ）
+    if (
+      FF.fillText(
+        [
+          'textarea[name*="description" i]',
+          'textarea[name*="detail" i]',
+          'textarea[id*="description" i]',
+          'textarea[id*="detail" i]',
+        ],
+        null,
+        value
+      )
+    ) {
+      return "textarea";
+    }
+    // 2) contenteditable の編集欄
+    if (FF.fillContentEditable(["商品の説明", "説明"], value)) return "editable";
+    // 3) エディタ iframe の body 自体が編集領域の場合
+    try {
+      if (document.body && document.body.isContentEditable) {
+        document.body.focus();
+        document.body.innerText = value;
+        document.body.dispatchEvent(new InputEvent("input", { bubbles: true }));
+        console.log("[FurimaCopy] description -> editable body", location.href);
+        return "body";
+      }
+    } catch (e) {
+      /* 次の手段へ */
+    }
+    // 4) 子フレーム内に textarea が 1 つだけならそれが編集欄とみなす
+    if (window !== window.top) {
+      const tas = Array.from(document.querySelectorAll("textarea")).filter((t) => FF.isVisible(t));
+      if (tas.length === 1) {
+        FF.setNativeValue(tas[0], value);
+        console.log("[FurimaCopy] description -> sole textarea in frame", location.href);
+        return "frame-textarea";
+      }
+    }
+    // 5) 隠れている backing textarea（画面には出ないため、経路を呼び出し側へ返す）
+    const ta = document.querySelector(
+      'textarea[name*="description" i], textarea[name*="detail" i], textarea[id*="description" i], textarea[id*="detail" i]'
+    );
+    if (ta) {
+      FF.setNativeValue(ta, value);
+      console.log("[FurimaCopy] description -> hidden textarea", ta);
+      return "hidden";
+    }
+    return false;
+  }
+
+  // 子フレーム（エディタ等）からの入力依頼を受ける。
+  window.addEventListener("message", (ev) => {
+    if (!ev.data || ev.data.type !== "FC_FILL_DESC" || (!ev.data.value && !ev.data.html)) return;
+    const code = fillDescriptionLocal(ev.data.value, ev.data.html);
+    console.log("[FurimaCopy] frame description fill:", location.href, code);
+    if (code) {
+      try {
+        window.parent.postMessage({ type: "FC_DESC_RESULT", ok: true }, "*");
+      } catch (e) {
+        /* 親へ通知できなくても入力自体は済んでいる */
+      }
+    }
+  });
+
+  // トップフレームから子フレームへ説明文の入力を依頼し、成否を待つ。
+  function requestFrameFillDescription(value, html) {
+    return new Promise((resolve) => {
+      const frames = Array.from(document.querySelectorAll("iframe"));
+      if (!frames.length) return resolve(false);
+      let settled = false;
+      const onMsg = (ev) => {
+        if (ev.data && ev.data.type === "FC_DESC_RESULT" && ev.data.ok) {
+          settled = true;
+          window.removeEventListener("message", onMsg);
+          resolve(true);
+        }
+      };
+      window.addEventListener("message", onMsg);
+      frames.forEach((f) => {
+        try {
+          if (f.contentWindow)
+            f.contentWindow.postMessage({ type: "FC_FILL_DESC", value, html }, "*");
+        } catch (e) {
+          /* 到達できないフレームは無視 */
+        }
+      });
+      setTimeout(() => {
+        window.removeEventListener("message", onMsg);
+        resolve(settled);
+      }, 1000);
+    });
+  }
+
+  // フォームの実態調査: このドキュメント内の全フィールドと iframe 一覧を出す。
+  function logFormCensus() {
+    try {
+      const fields = Array.from(document.querySelectorAll("input, textarea, select")).map((el) => ({
+        tag: el.tagName,
+        type: el.getAttribute("type") || "",
+        name: el.getAttribute("name") || "",
+        id: el.id || "",
+        ph: el.getAttribute("placeholder") || "",
+        visible: !!(el.offsetWidth || el.offsetHeight),
+      }));
+      console.log("[FurimaCopy] yahoo form census:", {
+        url: location.href,
+        inFrame: window !== window.top,
+        fieldCount: fields.length,
+        fields: fields.slice(0, 40),
+        iframes: Array.from(document.querySelectorAll("iframe")).map((f) => f.src || "(no src)"),
+      });
+    } catch (e) {
+      console.warn("[FurimaCopy] census failed", e);
+    }
+  }
+
+  // 配送方法ラジオ（name="shipmethod_dummy"）を名称で選ぶ。ラジオ自体からは
+  // 名称が読み取りにくい構造なので、方法名で始まる小さな表示要素を探して
+  // その行ごとクリックし、ラジオの checked で検証する。名称が完全に一致する
+  // 要素を優先し、候補が複数名称にまたがる場合は選ばない（誤選択防止）。
+  function selectShipMethod(method) {
+    const norm = (s) =>
+      String(s || "").replace(/[\s　]/g, "").replace(/（EAZY）|\(EAZY\)/gi, "");
+    const target = norm(method);
+    if (!target) return false;
+    const radios = Array.from(
+      document.querySelectorAll('input[type="radio"][name="shipmethod_dummy"]')
+    );
+    if (!radios.length) return false;
+    const wasChecked = radios.map((r) => r.checked);
+    const namePartOf = (el) =>
+      norm(
+        ((el.innerText || el.textContent || "").replace(/\s+/g, " ").trim()).split(
+          /全国一律|円/
+        )[0]
+      );
+    const all = Array.from(document.querySelectorAll("label, div, span, td, li, a"))
+      .filter((el) => {
+        if (!FF.isVisible(el)) return false;
+        const t = (el.innerText || "").replace(/\s+/g, " ").trim();
+        if (!t || t.length > 90) return false;
+        const np = namePartOf(el);
+        return np === target || np.startsWith(target);
+      })
+      .sort((a, b) => (a.innerText || "").length - (b.innerText || "").length);
+    const exact = all.filter((el) => namePartOf(el) === target);
+    let pool = exact.length ? exact : all;
+    if (!exact.length) {
+      const distinct = new Set(pool.map((el) => namePartOf(el)));
+      if (distinct.size !== 1) {
+        console.log("[FurimaCopy] ship method ambiguous:", Array.from(distinct), "for", method);
+        return false;
+      }
+    }
+    for (const el of pool) {
+      // その要素を含む「ラジオ 1 つだけの行」をクリック対象にする。
+      let row = el;
+      for (let n = el; n && n !== document.body; n = n.parentElement) {
+        if (
+          n.querySelectorAll &&
+          n.querySelectorAll('input[name="shipmethod_dummy"]').length === 1
+        ) {
+          row = n;
+          break;
+        }
+      }
+      FF.clickLikeUser(row);
+      const nowChecked = radios.filter((r) => r.checked);
+      if (nowChecked.length === 1) {
+        const rowRadios = row.querySelectorAll
+          ? row.querySelectorAll('input[name="shipmethod_dummy"]')
+          : [];
+        if (rowRadios.length === 1 && rowRadios[0].checked) return true;
+        // 行とラジオを対応付けできない場合は、このクリックで新たに
+        // チェックが付いたこと自体を根拠にする。
+        if (!wasChecked[radios.indexOf(nowChecked[0])]) return true;
+      }
+    }
+    return false;
+  }
+
+  // 編集欄に実際に入った説明テキストを読み戻す（入力検証用）。
+  function readBackDescriptionText() {
+    const frames = Array.from(document.querySelectorAll("iframe"));
+    const inDescArea = frames.filter((f) => f.closest("#descriptionArea"));
+    const rteLike = frames.filter((f) => /rte|editor/i.test(f.id || ""));
+    const targets = inDescArea.length ? inDescArea : rteLike;
+    for (const f of targets) {
+      try {
+        const doc = f.contentDocument;
+        if (doc && doc.body) {
+          const t = (doc.body.innerText || doc.body.textContent || "").trim();
+          if (t) return t;
+        }
+      } catch (e) {
+        /* 触れないフレームは飛ばす */
+      }
+    }
+    const plain = document.getElementById("Description_plain");
+    if (plain && plain.value) return String(plain.value).trim();
+    const flea = document.getElementById("fleaDescription");
+    if (flea && flea.value) return String(flea.value).trim();
+    return null;
+  }
+
+  async function handleFill() {
+    logFormCensus();
+    const data = await FC.load();
+    if (!data) {
+      FC.ui.showToast("コピー済みの商品がありません");
+      return;
+    }
+    console.log("[FurimaCopy] yahoo fill with: v" + VERSION, data);
+    const lines = [];
+
+    // タイトル
+    const titleOk = FF.fillText(
+      ['input[name*="title" i]', 'input[id*="title" i]', 'input[placeholder*="タイトル"]'],
+      ["タイトル", "商品名"],
+      data.title
+    );
+    lines.push({
+      label: "タイトル",
+      status: titleOk ? "ok" : "fail",
+      note: titleOk ? undefined : data.title ? "入力欄が見つかりませんでした" : "コピー元にタイトルがありません",
+    });
+
+    // 商品の説明: このフレームで試し、ダメなら子フレーム（エディタ）に依頼する。
+    // Yahoo!→Yahoo! で説明の HTML が取れている場合は、書式ごとエディタへ入れる。
+    const descHtml =
+      data.source === "yahoo" && data.descriptionHtml ? data.descriptionHtml : null;
+    let descText = data.description || null;
+    if (!descText && descHtml) {
+      const tmp = document.createElement("div");
+      tmp.innerHTML = descHtml;
+      descText = (tmp.textContent || "").trim() || null;
+    }
+    let descCode = false;
+    if (descText || descHtml) {
+      descCode = fillDescriptionLocal(descText, descHtml);
+      if (!descCode && (await requestFrameFillDescription(descText, descHtml))) {
+        descCode = descHtml ? "frame-message-html" : "frame-message";
+      }
+    }
+    let descStatus = descCode ? "ok" : "fail";
+    let descNote = !descText && !descHtml
+      ? "コピー元に説明がありません"
+      : !descCode
+        ? "入力欄が見つかりませんでした"
+        : descCode === "hidden"
+          ? "（画面に表示されない欄へ入力・要確認）"
+          : String(descCode).includes("html")
+            ? "（書式ごとコピー）"
+            : undefined;
+    if (descCode && descText) {
+      // 編集欄を読み戻して文字数で検証する（見た目だけの成功申告をしない）。
+      await new Promise((r) => setTimeout(r, 700));
+      const back = readBackDescriptionText();
+      if (back) {
+        if (back.length >= descText.length * 0.9) {
+          descNote =
+            "（全文 " + back.length + " 字を確認" +
+            (String(descCode).includes("html") ? "・書式ごとコピー" : "") + "）";
+        } else {
+          descStatus = "fail";
+          descNote =
+            "編集欄の文字数が不足しています（入力 " + back.length +
+            " 字 / コピー元 " + descText.length + " 字）";
+        }
+      } else {
+        descStatus = "manual";
+        descNote = "入力しましたが読み戻し確認ができませんでした（目視で確認してください）";
+      }
+    }
+    lines.push({ label: "商品の説明", status: descStatus, note: descNote });
+
+    // 開始価格（コピー元の価格をそのまま入れる。希望落札価格は手動）
+    const priceOk = FF.fillText(
+      ['input[name*="startprice" i]', 'input[name*="price" i]', 'input[name*="start" i]', 'input[id*="price" i]'],
+      ["開始価格"],
+      data.price != null ? String(data.price) : null
+    );
+    lines.push({
+      label: "開始価格",
+      status: priceOk ? "ok" : "fail",
+      note: priceOk ? "¥" + Number(data.price).toLocaleString("ja-JP") : data.price != null ? "入力欄が見つかりませんでした" : "コピー元に価格がありません",
+    });
+    lines.push({
+      label: "希望落札価格",
+      status: "manual",
+      note: "手動で入力してください（開始価格と同じにするか空欄）",
+    });
+
+    // 画像（単体ファイル入力が複数ある前提で配布される）
+    if (data.imageUrls && data.imageUrls.length) {
+      const r = await FF.attachImages(data.imageUrls, { incremental: true });
+      lines.push({
+        label: "画像",
+        status: r.attached ? "ok" : "fail",
+        note: r.attached + "枚添付" + (r.failed ? " / " + r.failed + "枚失敗" : ""),
+      });
+    } else {
+      lines.push({ label: "画像", status: "fail", note: "コピー元に画像がありません" });
+    }
+
+    // 商品の状態（ネイティブ select をテキスト一致で試す）
+    // 2026-11-17 実測: Yahoo! の状態はネイティブ select で、選択肢は
+    // 未使用 / 未使用に近い / 目立った傷や汚れなし / やや傷や汚れあり /
+    // 傷や汚れあり / 全体的に状態が悪い。最上位の呼び名だけが他プラットフォーム
+    // と違う（Mercari 等の「新品、未使用」＝ Yahoo! の「未使用」）ため、
+    // 候補に相互の表記を加えてクロスプラットフォーム複写でも選べるようにする。
+    const condSel = FF.findSelect(
+      ['select[name*="condition" i]', 'select[name*="state" i]', 'select[id*="condition" i]'],
+      ["商品の状態", "状態"]
+    );
+    const condCandidates = [];
+    if (data.conditionText) {
+      condCandidates.push(data.conditionText);
+      if (data.conditionText === "新品、未使用") condCandidates.push("未使用");
+      if (data.conditionText === "未使用") condCandidates.push("新品、未使用");
+    }
+    const condOk = condSel && condCandidates.length
+      ? FF.trySelectByText(condSel, condCandidates)
+      : false;
+    const condShown =
+      condOk && condSel && condSel.selectedIndex >= 0
+        ? condSel.options[condSel.selectedIndex].text
+        : data.conditionText;
+    lines.push({
+      label: "商品の状態",
+      status: condOk ? "ok" : "manual",
+      note: condOk ? condShown : "手動" + (data.conditionText ? "（候補： " + data.conditionText + "）" : "で選択してください"),
+    });
+
+    // 配送まわり: コピー元が Yahoo! で構造化データが取れている場合だけ自動選択を試す。
+    let shipHandled = false;
+    if (
+      data.source === "yahoo" &&
+      (data.shippingMethod || data.shippingBurden || data.shipFrom || data.shipDays)
+    ) {
+      if (data.shippingMethod) {
+        shipHandled = true;
+        const ok = selectShipMethod(data.shippingMethod);
+        lines.push({
+          label: "配送方法",
+          status: ok ? "ok" : "fail",
+          note: ok ? data.shippingMethod : "自動選択できませんでした（候補： " + data.shippingMethod + "）",
+        });
+      }
+      if (data.shippingBurden) {
+        shipHandled = true;
+        const radio = document.querySelector(
+          'input[type="radio"][name="shipping_dummy"][value="' + data.shippingBurden + '"]'
+        );
+        let ok = false;
+        if (radio) {
+          FF.clickLikeUser(radio.closest("label") || radio);
+          if (!radio.checked) {
+            try { radio.click(); } catch (e) { /* 下で検証する */ }
+          }
+          ok = radio.checked;
+        }
+        lines.push({
+          label: "送料負担",
+          status: ok ? "ok" : "fail",
+          note: data.shippingBurden === "seller" ? "出品者" : "落札者",
+        });
+      }
+      if (data.shipFrom) {
+        shipHandled = true;
+        const sel = document.querySelector('select[name="loc_cd"]');
+        const ok = sel ? FF.trySelectByText(sel, [data.shipFrom]) : false;
+        lines.push({
+          label: "発送元地域",
+          status: ok ? "ok" : "fail",
+          note: ok && sel.selectedIndex >= 0
+            ? sel.options[sel.selectedIndex].text.trim()
+            : "候補： " + data.shipFrom,
+        });
+      }
+      if (data.shipDays) {
+        shipHandled = true;
+        const sel = document.querySelector('select[name="shipschedule"]');
+        const ok = sel ? FF.trySelectByText(sel, [data.shipDays]) : false;
+        lines.push({
+          label: "発送までの日数",
+          status: ok ? "ok" : "fail",
+          note: ok && sel.selectedIndex >= 0
+            ? sel.options[sel.selectedIndex].text.trim()
+            : "候補： " + data.shipDays,
+        });
+      }
+    }
+    if (!shipHandled) {
+      lines.push({
+        label: "配送・送料",
+        status: "manual",
+        note: "手動" + (data.shippingText ? "（候補： " + data.shippingText + "）" : "で選択してください"),
+      });
+    }
+
+    // カテゴリ: 選択済みで候補と一致すれば OK。未選択なら保留データを置き、
+    // このページの入力を全部終えたあとで選択ページへ遷移する（最後に処理）。
+    let pendingCategoryNav = null;
+    const catSegments = data.categoryText
+      ? data.categoryText.split(/[>＞]+/).map((s) => s.trim()).filter(Boolean)
+      : [];
+    const catLeaf = catSegments.length ? catSegments[catSegments.length - 1] : "";
+    const catInput = document.querySelector('input[name="category"]');
+    const catTextEl = document.querySelector(".Category__text");
+    const catShown = catTextEl ? (catTextEl.textContent || "").trim() : "";
+    if (
+      data.categoryText &&
+      catInput && catInput.value && catInput.value !== "0" &&
+      catShown.includes(catLeaf)
+    ) {
+      lines.push({ label: "カテゴリ", status: "ok", note: catShown });
+      try { await chrome.storage.local.remove(CATEGORY_PENDING_KEY); } catch (e) { /* noop */ }
+    } else if (data.categoryText) {
+      lines.push({
+        label: "カテゴリ",
+        status: "manual",
+        note: "このあと選択ページで自動選択します（候補： " + data.categoryText + "）",
+      });
+      pendingCategoryNav = { segments: catSegments };
+    } else {
+      lines.push({ label: "カテゴリ", status: "manual", note: "手動で選択してください" });
+    }
+
+    lines.push({
+      label: "送信前確認",
+      status: "manual",
+      note: "内容を確認してから出品してください（自動送信はしません）",
+    });
+
+    FF.showPanel("Yahoo!オークション 出品フォーム入力結果 (v" + VERSION + ")", lines);
+
+    // カテゴリ未選択なら、保留データを置いて選択ページへ遷移する。
+    if (pendingCategoryNav) {
+      try {
+        await chrome.storage.local.set({
+          [CATEGORY_PENDING_KEY]: {
+            segments: pendingCategoryNav.segments,
+            path: data.categoryText,
+            at: Date.now(),
+          },
+        });
+      } catch (e) {
+        /* 置けなければ遷移しない（手動選択に倒れる） */
+        pendingCategoryNav = null;
+      }
+      if (pendingCategoryNav) {
+        setTimeout(() => {
+          const btn =
+            document.getElementById("acMdCateChange") ||
+            document.querySelector(".Category__button");
+          if (btn) FF.clickLikeUser(btn);
+        }, 900);
+      }
+    }
+  }
+
+  // ボタンはトップフレームだけに置く（子フレームでは message 連携のみ）。
+  if (window === window.top) {
+    FF.mountFillButton(handleFill, null, "yahoo");
+    // カテゴリ選択ページから戻ってきたら、保留データと実際の選択を照合する。
+    (async () => {
+      for (let i = 0; i < 5; i++) {
+        let pending = null;
+        try {
+          const res = await chrome.storage.local.get(CATEGORY_PENDING_KEY);
+          pending = res[CATEGORY_PENDING_KEY] || null;
+        } catch (e) {
+          /* 読めなければ諦める */
+        }
+        if (!pending || !pending.segments || !pending.segments.length) return;
+        const catInput = document.querySelector('input[name="category"]');
+        const catTextEl = document.querySelector(".Category__text");
+        const shown = catTextEl ? (catTextEl.textContent || "").trim() : "";
+        const leaf = pending.segments[pending.segments.length - 1];
+        if (catInput && catInput.value && catInput.value !== "0" && shown.includes(leaf)) {
+          try { await chrome.storage.local.remove(CATEGORY_PENDING_KEY); } catch (e) { /* noop */ }
+          FC.ui.showToast("カテゴリを自動選択しました：" + (pending.path || shown));
+          return;
+        }
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+    })();
+  }
+})();

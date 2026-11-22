@@ -1,6 +1,16 @@
 <script setup>
   import { ref, reactive, watch } from 'vue';
-  import { mgrInfoFlag, mgrInfo, nodes, renameNode, deleteNodeById } from '../store';
+  import { mgrInfoFlag, mgrInfo, nodes, renameNode, deleteNodeById, saveExtDeployPaths } from '../store';
+
+  const extPathsText = ref('');
+  const syncExtDraft = () => {
+    extPathsText.value = (mgrInfo.value.extPaths || []).join('\n')
+  };
+  watch(mgrInfo, syncExtDraft);
+  const savePaths = () => {
+    const arr = extPathsText.value.split('\n').map((s) => s.trim()).filter(Boolean);
+    saveExtDeployPaths(arr);
+  };
 
   const nodeDrafts = reactive({});
   watch(mgrInfoFlag, (open) => {
@@ -34,6 +44,13 @@
       <a-descriptions-item label="状態">{{ mgrInfo.running ? '起動中' : '未起動' }}</a-descriptions-item>
     </a-descriptions>
     <p class="mgr-note">拡張機能（フリマコピー）のポップアップ「出品管理プログラム連携」に、同じトークンを入力して有効にしてください。</p>
+
+    <h4 class="nodes-title">拡張機能の配置先</h4>
+    <p class="mgr-note" style="margin: 0 0 8px;">同梱の拡張機能は、起動時に正規フォルダ（{{ mgrInfo.extCanonicalPath || '—' }}／配置済み v{{ mgrInfo.extVersion || '—' }}）へ自動配置されます。Chrome で読み込んでいるフォルダが別の場所にある場合は、1行に1つずつフルパスを書いて保存してください（保存すると即配置します）。空にすると正規フォルダのみへの配置になります。</p>
+    <a-textarea v-model:value="extPathsText" :rows="3" placeholder="G:\project\furima-copy-extension" />
+    <div style="margin-top: 8px; text-align: right;">
+      <a-button size="small" type="primary" @click="savePaths">保存して配置</a-button>
+    </div>
 
     <h4 class="nodes-title">ブラウザ（ノード）</h4>
     <p class="mgr-note" style="margin: 0 0 8px;">各 Chrome プロファイルが1つのノードです。名前はここでのみ登録します（重複不可）。名前を付けたノードは、そのノード宛のタスクだけを受け取ります。</p>

@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>在庫台帳 - フリマコピー（自作）</title>
+<style>
+  body { font-family: "Hiragino Kaku Gothic ProN", "Yu Gothic", sans-serif; margin: 0; background: #f6f6f8; color: #222; }
+  header { background: #fff; border-bottom: 1px solid #e3e3e8; padding: 14px 20px; position: sticky; top: 0; z-index: 5; }
+  h1 { font-size: 18px; margin: 0 0 8px; }
+  #summary { font-size: 13px; color: #444; }
+  #summary b { color: #e60023; }
+  main { max-width: 980px; margin: 0 auto; padding: 16px; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+  .toolbar input[type="search"] { flex: 1; min-width: 180px; padding: 8px 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 13px; }
+  select, input[type="text"], input[type="number"], textarea { padding: 6px 8px; border: 1px solid #ccc; border-radius: 6px; font-size: 13px; }
+  button { padding: 7px 12px; font-size: 13px; font-weight: 700; border: 1px solid #ddd; background: #fff; border-radius: 6px; cursor: pointer; }
+  button:hover { background: #f0f0f3; }
+  button.primary { background: #0a7ea4; color: #fff; border-color: #0a7ea4; }
+  button.danger { color: #c00; }
+  .panel { background: #fff; border: 1px solid #e3e3e8; border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; }
+  .panel h2 { font-size: 14px; margin: 0 0 8px; }
+  .panel textarea { width: 100%; box-sizing: border-box; min-height: 64px; }
+  #importStatus { font-size: 12px; color: #666; white-space: pre-wrap; margin-top: 6px; }
+  .card { background: #fff; border: 1px solid #e3e3e8; border-radius: 10px; padding: 12px 14px; margin-bottom: 12px; display: flex; gap: 14px; }
+  .card.delist { border-color: #e60023; box-shadow: 0 0 0 1px #e60023 inset; }
+  .thumb { width: 96px; height: 96px; object-fit: cover; border-radius: 8px; background: #eee; flex: none; }
+  .grow { flex: 1; min-width: 0; }
+  .titleRow { display: flex; gap: 8px; align-items: center; }
+  .code { background: #222; color: #fff; font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 999px; flex: none; }
+  .titleInput { flex: 1; font-weight: 700; }
+  .grid { display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 8px; font-size: 12px; color: #555; align-items: center; }
+  .grid label { display: flex; gap: 4px; align-items: center; }
+  .grid input[type="number"] { width: 76px; }
+  .grid input[type="text"] { width: 130px; }
+  .listings { margin-top: 10px; border-top: 1px dashed #ddd; padding-top: 8px; }
+  .listing { display: flex; gap: 8px; align-items: center; font-size: 12px; padding: 3px 0; flex-wrap: wrap; }
+  .plat { font-weight: 700; background: #eef3f6; padding: 1px 7px; border-radius: 999px; }
+  .warn { color: #e60023; font-weight: 700; font-size: 12px; }
+  .sales { font-size: 12px; color: #777; margin-top: 6px; }
+  .dupGroup { border: 1px solid #f0c36d; background: #fffaf0; border-radius: 10px; padding: 10px 12px; margin-bottom: 10px; }
+  .dupItem { display: inline-flex; gap: 6px; align-items: center; margin: 4px 10px 4px 0; font-size: 12px; }
+  .dupItem img { width: 40px; height: 40px; object-fit: cover; border-radius: 6px; }
+  .small { font-size: 12px; color: #888; }
+</style>
+</head>
+<body>
+<header>
+  <h1>在庫台帳（フリマコピー）</h1>
+  <div id="summary">読み込み中…</div>
+</header>
+<main>
+  <div class="toolbar">
+    <input type="search" id="q" placeholder="商品名・管理番号で検索">
+    <select id="statusFilter">
+      <option value="">すべての状態</option>
+    </select>
+    <button id="btnNew" type="button">＋ 新規レコード</button>
+    <button id="btnCsv" type="button">CSV 書き出し</button>
+    <button id="btnJson" type="button">JSON 書き出し</button>
+    <label class="small">JSON 読み込み <input type="file" id="fileJson" accept=".json,application/json"></label>
+  </div>
+
+  <div class="panel" id="newPanel" hidden>
+    <h2>新規レコード</h2>
+    <div class="grid">
+      <label>商品名 <input type="text" id="newTitle" style="width:260px"></label>
+      <label>数量 <input type="number" id="newQty" value="1" min="0"></label>
+      <label>仕入価格 <input type="number" id="newCost" placeholder="任意"></label>
+      <label>仕入先 <input type="text" id="newChannel"></label>
+      <label>保管場所 <input type="text" id="newLocation"></label>
+      <button class="primary" id="btnCreate" type="button">作成（番号を自動採番）</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>URL 一括取り込み（既存の出品を取り込む）</h2>
+    <p class="small">各プラットフォームの自分の商品 URL を 1 行に 1 件ずつ貼って「取り込み開始」。タブを順に開いて読み取り、在庫レコードを作成/バインドします。説明文に管理番号があればその番号で一致させます。</p>
+    <textarea id="importUrls" placeholder="https://jp.mercari.com/item/m..."></textarea>
+    <div style="margin-top:8px"><button class="primary" id="btnImport" type="button">取り込み開始</button></div>
+    <div id="importStatus"></div>
+  </div>
+
+  <div id="dupSection"></div>
+  <div id="items"></div>
+</main>
+<script src="lib/inventory.js"></script>
+<script src="ledger.js"></script>
+</body>
+</html>

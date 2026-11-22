@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>フリマコピー（自作）</title>
+<style>
+  body {
+    font-family: "Hiragino Kaku Gothic ProN", "Yu Gothic", sans-serif;
+    width: 320px;
+    margin: 0;
+    padding: 14px;
+    color: #222;
+    background: #fff;
+  }
+  h1 { font-size: 15px; margin: 0 0 10px; }
+  #empty { font-size: 13px; line-height: 1.6; color: #555; }
+  #thumb {
+    width: 100%;
+    max-height: 180px;
+    object-fit: cover;
+    border-radius: 6px;
+    background: #f2f2f2;
+  }
+  #source {
+    display: inline-block;
+    margin-top: 8px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 700;
+    color: #fff;
+    background: #555;
+    border-radius: 999px;
+  }
+  #title { font-size: 14px; font-weight: 700; line-height: 1.5; margin-top: 6px; }
+  #price { font-size: 16px; font-weight: 700; color: #e60023; margin-top: 4px; }
+  #meta { font-size: 12px; color: #777; margin-top: 4px; }
+  #clear {
+    margin-top: 12px;
+    width: 100%;
+    padding: 8px 0;
+    font-size: 13px;
+    font-weight: 700;
+    color: #333;
+    background: #f0f0f0;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  #clear:hover { background: #e6e6e6; }
+  .note { font-size: 11px; color: #999; line-height: 1.6; margin: 12px 0 0; }
+  hr { border: none; border-top: 1px solid #eee; margin: 14px 0; }
+  h2 { font-size: 13px; margin: 0 0 8px; }
+  .row { display: flex; align-items: center; gap: 6px; margin: 6px 0; }
+  .row label { font-size: 12px; }
+  input[type="text"], input[type="url"], input[type="number"], select {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 6px 8px;
+    font-size: 12px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    margin: 4px 0;
+  }
+  input[type="number"] { width: 74px; }
+  select { width: auto; }
+  .btn {
+    padding: 7px 10px;
+    font-size: 12px;
+    font-weight: 700;
+    color: #333;
+    background: #f0f0f0;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  .btn:hover { background: #e6e6e6; }
+  #remoteStatus { font-size: 11px; color: #666; line-height: 1.6; margin-top: 6px; white-space: pre-wrap; word-break: break-all; }
+  #mgrStatus { font-size: 11px; color: #666; line-height: 1.6; margin-top: 6px; white-space: pre-wrap; word-break: break-all; }
+  #yahooScanStatus { font-size: 11px; color: #666; line-height: 1.6; margin-top: 6px; white-space: pre-wrap; word-break: break-all; }
+  input[type="password"] {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 6px 8px;
+    font-size: 12px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    margin: 4px 0;
+  }
+</style>
+</head>
+<body>
+  <h1>フリマコピー（自作）</h1>
+
+  <div id="empty">
+    まだコピーされた商品がありません。<br>
+    対応サイトの商品ページで「📋 この商品をコピー」ボタンを押してください。
+  </div>
+
+  <div id="item" hidden>
+    <img id="thumb" alt="商品画像">
+    <span id="source"></span>
+    <div id="title"></div>
+    <div id="price"></div>
+    <div id="meta"></div>
+    <button id="clear" type="button">クリア</button>
+  </div>
+
+  <p class="note">※ 使い方：商品ページで「📋 この商品をコピー」→ 別サイトの出品ページで「📥 コピー内容を入力」ボタンを押すと、フォームに自動入力されます（送信はされません）。</p>
+
+  <hr>
+  <h2>リモート指令（v0.5.0 検証版）</h2>
+  <div class="row">
+    <input type="checkbox" id="remoteEnabled">
+    <label for="remoteEnabled">リモート指令を受け付ける</label>
+  </div>
+  <input type="url" id="remoteCmdUrl" placeholder="指令 JSON の URL（Gist の api.github.com/gists/... など）">
+  <div class="row">
+    <button class="btn" id="remoteSave" type="button">設定を保存</button>
+    <button class="btn" id="remotePollNow" type="button">今すぐチェック</button>
+  </div>
+  <input type="url" id="remoteTestUrl" placeholder="テスト用：Mercari 商品 URL">
+  <div class="row">
+    <button class="btn" id="remoteTest" type="button">テスト実行（読み取り→出品ページ入力）</button>
+  </div>
+  <div id="remoteStatus"></div>
+  <p class="note">※ リモート実行でも出品ボタンは押しません。入力された出品ページが前面に開くので、内容を確認して自分で出品してください。</p>
+
+  <hr>
+  <h2>出品管理プログラム連携（v0.9.0）</h2>
+  <div class="row">
+    <input type="checkbox" id="mgrEnabled">
+    <label for="mgrEnabled">管理プログラムのタスクを受け付ける</label>
+  </div>
+  <input type="text" id="mgrBaseUrl" placeholder="http://127.0.0.1:17341">
+  <input type="password" id="mgrToken" placeholder="管理プログラムと共通のトークン">
+  <div class="row">
+    <button class="btn" id="mgrSave" type="button">設定を保存</button>
+    <button class="btn" id="mgrPollNow" type="button">今すぐチェック</button>
+  </div>
+  <div id="mgrStatus"></div>
+  <p class="note">※ PC の出品管理プログラムが作った自動出品タスクを実行します。出品まで自動で進めるのは、管理プログラムから来たタスクだけです（通常のコピー＆入力は従来どおり送信しません）。</p>
+  <hr>
+  <h2>Mercari Todo 扫描</h2>
+  <div class="row">
+    <input type="checkbox" id="todoScanEnabled">
+    <label for="todoScanEnabled">定时扫描 Todo 并同步售出状态</label>
+  </div>
+  <div class="row">
+    <label for="todoScanInterval">扫描间隔</label>
+    <input type="number" id="todoScanInterval" min="1" max="1440" step="1" value="5">
+    <select id="todoScanUnit">
+      <option value="minutes">分钟</option>
+      <option value="hours">小时</option>
+    </select>
+  </div>
+  <div class="row">
+    <button class="btn" id="todoScanNow" type="button">立即扫描 Todo</button>
+  </div>
+  <div class="row">
+    <button class="btn" id="todoScanSave" type="button">保存 Todo 扫描设置</button>
+  </div>
+  <p class="note">※ Todo 的定时扫描由上方开关控制；需要商品管理桌面程序正在运行，且连接地址和令牌已配置。</p>
+
+  <hr>
+  <h2>Yahoo!オークション 売却扫描</h2>
+  <div class="row">
+    <input type="checkbox" id="yahooScanEnabled">
+    <label for="yahooScanEnabled">定时扫描落札済み并同步售出状态</label>
+  </div>
+  <div class="row">
+    <label for="yahooScanInterval">扫描间隔</label>
+    <input type="number" id="yahooScanInterval" min="1" max="1440" step="1" value="5">
+    <select id="yahooScanUnit">
+      <option value="minutes">分钟</option>
+      <option value="hours">小时</option>
+    </select>
+  </div>
+  <div class="row">
+    <button class="btn" id="yahooScanNow" type="button">立即扫描 Yahoo</button>
+  </div>
+  <div class="row">
+    <button class="btn" id="yahooScanSave" type="button">保存 Yahoo 扫描设置</button>
+  </div>
+  <div id="yahooScanStatus"></div>
+  <p class="note">※ 只上报「発送をしてください」（已付款待发货）的商品；需要桌面程序 v0.1.7 以上且已为商品绑定雅虎参照。</p>
+
+  <script src="lib/store.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

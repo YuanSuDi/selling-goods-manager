@@ -33,6 +33,7 @@ const { createRelistTasks } = require('./main/relist-tasks')
 const { createDelist } = require('./main/delist')
 const { registerInventoryIpc } = require('./main/ipc-inventory')
 const { registerTaskIpc } = require('./main/ipc-tasks')
+const { syncExtensionBundle } = require('./main/extension-sync')
 
 
 const isDevelopment = process.env.NODE_ENV !== 'production'
@@ -75,6 +76,70 @@ function reportImageWorkflowError(sender, operation, error) {
 // タスクは tasks.db にも保存し、再起動時に pending 分を復元する。
 let managerServer = null
 let managerInfo = { port: 17341, token: '', running: false }
+
+// ---- 同梱拡張の配置（v0.2.18） ------------------------------------------
+// インストール済みアプリに同梱された FurimaCopy 拡張（app/extension）を、
+// 起動時に Chrome が読み込んでいる実フォルダへ同期する。同期が終わった
+// 版番号だけを deployedExtVersion に入れ、サーバ経由で拡張へ知らせる
+// （拡張は空き時間に自己再読み込みして追いつく、拡張側 v0.12.30）。
+// 配置先フォルダは連携情報モーダルから手入力できる（manager.json の
+// extPaths に保存）。未設定時の既定値は従来の 2 フォルダ。正規フォルダ
+// （ユーザーデータ/extension）へは常時配置する。
+let deployedExtVersion = null
+const DEFAULT_EXT_DEPLOY_PATHS = [
+  'G:\\project\\furima-copy-extension',
+  'D:\\tools\\furima-copy-extension',
+]
+let currentExtDeployPaths = DEFAULT_EXT_DEPLOY_PATHS.slice()
+
+function sanitizeExtPaths(list) {
+  const out = []
+  for (const p of Array.isArray(list) ? list : []) {
+    const s = String(p || '').trim()
+    if (s && !out.includes(s)) out.push(s)
+  }
+  return out.slice(0, 10)
+}
+
+function findExtensionBundleDir() {
+  const rel = path.join('app', 'extension')
+  const candidates = [
+    path.join(path.dirname(app.getPath('exe')), rel),
+    path.join(app.getAppPath(), rel),
+    path.resolve(rel),
+  ]
+  return candidates.find((c) => fs.existsSync(path.join(c, 'manifest.json'))) || null
+}
+
+function deployBundledExtension() {
+  try {
+    const bundleDir = findExtensionBundleDir()
+    if (!bundleDir) {
+      console.log('[ext-sync] bundled extension not found; skipped')
+      return
+    }
+    const canonical = path.join(userDataDir, 'extension')
+    const targets = [
+      // 正規フォルダ（管理プログラム所有、掃除あり）
+      { dir: canonical, prune: true },
+    ]
+    // 手入力の配置先（無ければ作る。削除はしない＝ .git 等が同居しうるため）
+    for (const p of currentExtDeployPaths) {
+      if (path.resolve(p).toLowerCase() !== canonical.toLowerCase()) {
+        targets.push({ dir: p })
+      }
+    }
+    const r = syncExtensionBundle({ bundleDir, targets })
+    if (r.ok) {
+      deployedExtVersion = r.version
+      console.log('[ext-sync] deployed extension v' + r.version, JSON.stringify(r.results))
+    } else {
+      console.warn('[ext-sync] deployment failed:', r.error || JSON.stringify(r.results))
+    }
+  } catch (e) {
+    console.warn('[ext-sync] deployment error:', e && e.message)
+  }
+}
 
 // ---- v0.2.0: 状態・出品レコード・ノードのデータ層 -------------------------
 let inventory = null
@@ -256,6 +321,15 @@ function startManagerServer() {
     fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2))
   }
   managerInfo = { port: cfg.port || 17341, token: cfg.token, running: false }
+  // 同梱拡張の配置（v0.2.18）: 配置先は manager.json の extPaths（モーダル
+  // から手入力可能）。未設定なら従来の 2 フォルダを既定値にする。
+  currentExtDeployPaths = Array.isArray(cfg.extPaths)
+    ? sanitizeExtPaths(cfg.extPaths)
+    : DEFAULT_EXT_DEPLOY_PATHS.slice()
+  managerInfo.extPaths = currentExtDeployPaths.slice()
+  managerInfo.extCanonicalPath = path.join(userDataDir, 'extension')
+  deployBundledExtension()
+  managerInfo.extVersion = deployedExtVersion
   const persistTask = (task) => {
     tasksDb.update({ id: task.id }, task, { upsert: true }, () => {})
   }
@@ -807,6 +881,7 @@ function startManagerServer() {
         .catch(() => {})
     },
     getNodeInfo: (nodeId) => nodeInfoCache.get(nodeId) || null,
+    getExtVersion: () => deployedExtVersion,
     onOwnershipClaim: async (claim) => {
       const r = await handleOwnershipClaim(claim)
       if (r && r.assigned) sendInventoryMeta()
@@ -1187,6 +1262,30 @@ async function createWindow() {
 
   //連携情報（ポートとトークン）を返す。拡張機能側の設定に使う。
   ipcMain.on('get_manager_info', (e) => {
+    e.sender.send('manager_info', managerInfo)
+  })
+
+  //同梱拡張の配置先フォルダの手入力保存（v0.2.18）。manager.json に
+  // extPaths として残し（トークン等は保持）、保存後すぐ再配置する。
+  ipcMain.on('set_ext_deploy_paths', (e, paths) => {
+    const clean = sanitizeExtPaths(paths)
+    currentExtDeployPaths = clean
+    managerInfo.extPaths = clean.slice()
+    try {
+      const cfgPath = path.join(userDataDir, 'manager.json')
+      let cfg = {}
+      try {
+        cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'))
+      } catch (err) { /* 読めなければ新規扱い（トークンは下書きで復元） */ }
+      if (!cfg.token) cfg.token = managerInfo.token
+      if (!cfg.port) cfg.port = managerInfo.port
+      cfg.extPaths = clean
+      fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2))
+    } catch (err) {
+      console.warn('[ext-sync] failed to save extPaths:', err && err.message)
+    }
+    deployBundledExtension()
+    managerInfo.extVersion = deployedExtVersion
     e.sender.send('manager_info', managerInfo)
   })
 
