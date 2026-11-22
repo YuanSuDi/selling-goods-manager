@@ -10,7 +10,7 @@
     conditions, nodes, defaultCondition, conditionName, nodeLabel,
     recordsFor, recordsForCondition, conditionStock, conditionSold, stockedConditions,
     platformName, saveCondition, deleteConditionById, saveListing, deleteListingById,
-    relistListing, claimListing, fixListingNode,
+    relistListing, claimListing, fixListingNode, setListingState,
     taskList,
   } from '../store';
   import { normalizeProductImageUrl } from '../utils/product-image'
@@ -329,6 +329,14 @@
     r && r.listing_state && r.listing_state !== 'live'
       ? LISTING_STATE_LABELS[r.listing_state] || ''
       : '';
+  // 状態は通常イベントで自動更新されるが、ズレたときは手動でも直せる
+  // ようにセレクトから直接選べるようにする（変更すると下架判定も走る）。
+  const LISTING_STATE_OPTIONS = [
+    { value: 'live', label: '状態：出品中' },
+    { value: 'sold', label: '状態：販売済' },
+    { value: 'unlisted', label: '状態：未出品' },
+    { value: 'unknown', label: '状態：要確認' },
+  ];
   // 手動下架の未処理エントリがある商品は行に印を出す。
   const hasManualDelist = (productNo) =>
     (taskList.value || []).some(
@@ -603,6 +611,13 @@
               :value="r.node_id || ''"
               :options="nodeOptions"
               @change="(v) => fixListingNode(r._id, v)"
+            />
+            <a-select
+              size="small"
+              style="width: 130px"
+              :value="r.listing_state || 'live'"
+              :options="LISTING_STATE_OPTIONS"
+              @change="(v) => setListingState(r._id, v)"
             />
             <a-button size="small" danger @click="askDeleteListing(r)">削除</a-button>
           </div>

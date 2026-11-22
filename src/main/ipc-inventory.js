@@ -133,6 +133,37 @@ function registerInventoryIpc(ctx) {
     if (result.ok) ctx.sendInventoryMeta()
   })
 
+  // 出品状態の手動修正。通常はイベントで自動更新されるが、実態と
+  // ズレたときにユーザーが直接直せるようにする。変更後は下架判定を
+  // 走らせる（例: 在庫0で「出品中」に直したら、その場で下架対象に
+  // なる）。値が同じでも判定は走らせる（再判定の受け皿）。
+  ipcMain.on('listing_set_state', async (e, data) => {
+    const state = (data || {}).state
+    if (!['live', 'sold', 'unlisted', 'unknown'].includes(state)) {
+      e.sender.send('listing_result', { ok: false, error: '状態の値が不正です。' })
+      return
+    }
+    const result = ctx.inventory
+      ? await ctx.inventory.updateListing((data || {}).id, {
+          listing_state: state,
+          state_at: new Date().toISOString(),
+        })
+          .then((rec) => ({ ok: !!rec, listing: rec }))
+          .catch((err) => ({ ok: false, error: String((err && err.message) || err) }))
+      : { ok: false, error: 'データ層が初期化されていません。' }
+    e.sender.send('listing_result', result)
+    if (result.ok) {
+      ctx.sendInventoryMeta()
+      if (result.listing && ctx.evaluateDelist) {
+        try {
+          await ctx.evaluateDelist(result.listing.product_no, result.listing.condition_id)
+        } catch (err) {
+          console.warn('[manager] delist evaluation after manual state set skipped:', err && err.message)
+        }
+      }
+    }
+  })
+
   ipcMain.on('node_rename', async (e, data) => {
     const result = ctx.inventory
       ? await ctx.inventory.renameNode((data || {}).nodeId, (data || {}).name)

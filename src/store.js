@@ -487,6 +487,7 @@ export const deleteListingById = (id) => ipc.send('listing_delete', { id })
 export const relistListing = (id) => ipc.send('listing_relist', { id })
 export const claimListing = (id) => ipc.send('listing_claim', { id })
 export const fixListingNode = (id, nodeId) => ipc.send('listing_fix_node', { id, node_id: nodeId })
+export const setListingState = (id, state) => ipc.send('listing_set_state', { id, state })
 export const renameNode = (nodeId, name) => ipc.send('node_rename', { nodeId, name })
 export const deleteNodeById = (nodeId) => ipc.send('node_delete', { nodeId })
 
