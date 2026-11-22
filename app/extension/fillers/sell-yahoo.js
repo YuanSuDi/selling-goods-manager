@@ -12,9 +12,9 @@
 //   - カテゴリは選択ページ（topsubmit）へ遷移して自動選択する（v0.12.6）:
 //     フォーム側で保留データを置いて「選択する」を押し、topsubmit 側の
 //     ドライバがパスを選んで確定する。主ルートは「リストから選択する」の
-//     ツリー逐次選択（v0.12.28、実測で確定した確実な経路）。キーワード
-//     検索＋完全一致はフォールバック（Yahoo! の検索索引に載らない
-//     カテゴリがあり、確率で失敗するため主ルートにしない）
+//     ツリー逐次選択（v0.12.28 で導入、v0.12.31 で実 DOM に合わせて改修）。
+//     キーワード検索＋完全一致はフォールバック（Yahoo! の検索索引に
+//     載らないカテゴリがあり、確率で失敗するため主ルートにしない）
 //   - 説明文は入力後に編集欄を読み戻し、文字数で検証してから OK とする
 // 送信・出品ボタンは絶対に押さない。
 (() => {
@@ -109,20 +109,21 @@
         .map((lab) => FF.normalizeText(lab.textContent || ""))
         .join("|")
         .slice(0, 400);
+    const findConfirmButton = () => {
+      const btns = Array.from(
+        document.querySelectorAll('button, input[type="submit"], input[type="button"]')
+      ).filter(
+        (b) =>
+          FF.isVisible(b) &&
+          !b.disabled &&
+          FF.normalizeText(b.textContent || b.value || "").includes("このカテゴリに出品")
+      );
+      return btns[0] || null;
+    };
     const clickConfirmButton = async () => {
-      const confirmBtn = await FF.waitFor(() => {
-        const btns = Array.from(
-          document.querySelectorAll('button, input[type="submit"], input[type="button"]')
-        ).filter(
-          (b) =>
-            FF.isVisible(b) &&
-            !b.disabled &&
-            FF.normalizeText(b.textContent || b.value || "").includes("このカテゴリに出品")
-        );
-        return btns[0] || null;
-      }, 6000, 250);
+      const confirmBtn = await FF.waitFor(findConfirmButton, 6000, 250);
       if (!confirmBtn) return false;
-      FF.clickLikeUser(confirmBtn);
+      realClick(confirmBtn);
       return true;
     };
     const selectHit = async (hit) => {
@@ -137,26 +138,70 @@
       // 成功時は保留データを残す。フォーム側が実際の選択と照合して消す。
     };
     // ---- 主ルート: 「リストから選択する」のツリーをパス通り辿る（v0.12.28） ----
-    // 実測（2026-11-22）: 左→右に列が増える逐次展開 UI。子ありは右端に「>」、
-    // 一部カテゴリ名は末尾に「@」装飾。下部「選択したカテゴリ」に現在の
-    // パスが「>」連結で表示される。葉を押すと「このカテゴリに出品」が出る。
+    // 実測（2026-11-22）: 左→右に列が増える逐次展開 UI。葉を押すと
+    // 「このカテゴリに出品」が出る。v0.12.31 で実 DOM に合わせて改修:
+    // 行は <a>、座標付きクリック、成否は次列の出現で判定（詳細は下記）。
     // キーワード検索は Yahoo! 側の索引に載らないカテゴリがあり確率で失敗
     // するため、ツリーを主ルート、検索をフォールバックにする。
+    // 行の実測（2026-11-22 夜、詰まったページの実 DOM 確認）:
+    //   - 行は <a href="javascript:void(0)"> で、text は名前そのもの。
+    //     「>」は CSS 等の別要素で text には入らない。「@」は text に含まれる。
+    //   - 一部の行は同じ文言が 2 回繰り返された text を持つ
+    //     （例「スマートフォン、携帯電話@ スマートフォン、携帯電話 @」）。
+    //   - 座標なしの合成イベントでは 3 段目で止まった実績があるため、
+    //     実マウス相当の座標付きイベントで押す（realClick）。
+    //   - 成否判定は「次の段の列（または確定ボタン）が出たか」で行う。
+    //     選択中パスの読み出し照合は使わない。同じ行の盲目的な再クリックは
+    //     トグルで選択を外しかねないので、進展が無いときだけ 1 回まで。
     const cleanEntryText = (t) =>
       FF.normalizeText(t || "").replace(/[>＞@]\s*$/g, "").trim();
-    const findTreeEntry = (name) => {
-      const cands = Array.from(
-        document.querySelectorAll('a, button, li, [role="button"], [role="option"]')
-      ).filter((el) => FF.isVisible(el) && cleanEntryText(el.textContent) === name);
-      return cands[0] || null;
+    const squash = (x) => String(x || "").replace(/[\s@]/g, "");
+    const entryTextMatches = (raw, name) => {
+      if (cleanEntryText(raw) === name) return true;
+      const sq = squash(raw);
+      const sn = squash(name);
+      if (!sn) return false;
+      if (sq === sn) return true; // @ や空白の装飾差のみ
+      return sq.length === sn.length * 2 && sq === sn + sn; // 文言の繰り返し行
     };
-    const selectedPathShown = (upto) => {
-      const want = segments.slice(0, upto + 1).join(">");
-      const els = Array.from(document.querySelectorAll("div, p, span, td, dd, li"));
-      return els.some((el) => {
-        const t = FF.normalizeText(el.textContent || "").replace(/\s*>\s*/g, ">");
-        return t === want || t.endsWith(">" + want) || t.includes("選択したカテゴリ") && t.includes(want);
-      });
+    const findTreeEntry = (name) => {
+      // 行は <a>。まずアンカーだけから探し、無ければ他の要素も見る。
+      const anchors = Array.from(document.querySelectorAll("a")).filter(
+        (el) => FF.isVisible(el) && entryTextMatches(el.textContent, name)
+      );
+      if (anchors.length) return anchors[0];
+      const others = Array.from(
+        document.querySelectorAll('button, li, [role="button"], [role="option"]')
+      ).filter((el) => FF.isVisible(el) && entryTextMatches(el.textContent, name));
+      return others[0] || null;
+    };
+    // 要素の中心座標へ実マウス相当のイベント列を送る。座標なしの合成
+    // イベント（FF.clickLikeUser）は座標で対象を決めるハンドラに届かない
+    // ことがあるため、ツリー行とタブはこちらを使う。実際にその座標で
+    // 最前面にある要素へ送る（行内の子要素が受けてもバブリングで届く）。
+    const realClick = (el) => {
+      if (!el) return false;
+      try {
+        el.scrollIntoView({ block: "center" });
+        const r = el.getBoundingClientRect();
+        const x = r.left + r.width / 2;
+        const y = r.top + r.height / 2;
+        const target = document.elementFromPoint(x, y) || el;
+        const opts = {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+          clientX: x,
+          clientY: y,
+          button: 0,
+        };
+        for (const t of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+          target.dispatchEvent(new MouseEvent(t, opts));
+        }
+        return true;
+      } catch (e) {
+        return false;
+      }
     };
     const drillDown = async () => {
       const tab = await FF.waitFor(() => {
@@ -166,20 +211,20 @@
         return tabs[0] || null;
       }, 8000, 250);
       if (!tab) return false;
-      FF.clickLikeUser(tab);
+      realClick(tab);
       for (let i = 0; i < segments.length; i++) {
         const entry = await FF.waitFor(() => findTreeEntry(segments[i]), 9000, 300);
         if (!entry) return false;
-        FF.clickLikeUser(entry);
-        // 効いていなければネイティブ click でもう一度だけ試す
-        const okPath = await FF.waitFor(
-          () => (selectedPathShown(i) ? true : null),
-          2500,
-          250
-        );
-        if (!okPath) {
-          try { entry.click(); } catch (e) { /* 次の検証に委ねる */ }
-          await FF.waitFor(() => (selectedPathShown(i) ? true : null), 2500, 250);
+        const isLeaf = i === segments.length - 1;
+        const progressed = () =>
+          isLeaf ? !!findConfirmButton() : !!findTreeEntry(segments[i + 1]);
+        realClick(entry);
+        let ok = await FF.waitFor(() => (progressed() ? true : null), 6000, 300);
+        if (!ok) {
+          // 進展が無いときだけ、ネイティブ click で 1 回だけ打ち直す
+          try { entry.click(); } catch (e) { /* 次の判定に委ねる */ }
+          ok = await FF.waitFor(() => (progressed() ? true : null), 6000, 300);
+          if (!ok) return false;
         }
       }
       // 葉まで辿れたら確定ボタンが出るはず

@@ -41,31 +41,6 @@ async function fetchWithFallbacks(url, referrer) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  // リモート指令まわり（ポップアップからの手動チェック / テスト実行）。
-  if (message && message.type === "FurimaRemotePollNow") {
-    pollRemoteCommands("manual").then((r) => sendResponse(r || { ok: true }));
-    return true;
-  }
-  if (message && message.type === "FurimaRemoteTest") {
-    (async () => {
-      if (remoteRunning) {
-        sendResponse({ ok: false, error: "別の指令を実行中です" });
-        return;
-      }
-      remoteRunning = true;
-      try {
-        const result = await executeRelist({
-          id: "test-" + Date.now(),
-          type: "relist",
-          itemUrl: message.itemUrl || "",
-        });
-        sendResponse({ ok: result.status !== "error", result });
-      } finally {
-        remoteRunning = false;
-      }
-    })();
-    return true;
-  }
   // 出品ページで画像の取込データが無かったときの取り直し（filler からの依頼、v0.7.13）。
   if (message && message.type === "FurimaRecaptureImages" && message.itemUrl) {
     recaptureImages(message.itemUrl).then((r) => sendResponse(r));
@@ -100,46 +75,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 // ============================================================================
-// リモート指令（v0.5.0、半自動・検証版）
-// ----------------------------------------------------------------------------
-// 仕組み: ポップアップで指定した「指令 URL」を 1 分ごとに取得し、
-// { "id": "...", "type": "relist", "itemUrl": "https://jp.mercari.com/item/..." }
-// という JSON が来ていたら、まだ実行していない id のものだけを実行する。
-// 実行内容: 商品ページを裏タブで開いて読み取り（コピー）→ 出品ページを
-// 前面タブで開いて自動入力 → 結果を chrome.storage.local の lastRemoteResult
-// と remoteConfig.lastStatus に残す（ポップアップで確認できる）。
-// 安全策:
-//   - 出品（送信）ボタンは絶対に押さない。入力までで止まる。
-//   - 対応は Mercari の再出品のみ（検証版）。他サイト URL はエラーにする。
-//   - リモート実行はポップアップのスイッチが ON のときだけ有効。
-//   - 同じ指令 id は二度実行しない。
+// リモート指令（v0.5.0）は v0.12.31 で廃止した。ポップアップ UI・指令
+// ポーリング・テスト実行・executeRelist をすべて撤去し、Gist 経由の
+// 再出品指令は受け付けない。remoteSleep / startKeepAlive などの共通
+// ヘルパはこの下に残してある（管理プログラムのタスク実行が使う）。
 // ============================================================================
-
-const REMOTE_ALARM = "fcRemotePoll";
-const REMOTE_DEFAULTS = {
-  enabled: false,
-  cmdUrl: "",
-  lastCmdId: null,
-  lastPollAt: null,
-  lastStatus: "未設定",
-};
-
-let remoteRunning = false;
 
 function remoteSleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function getRemoteConfig() {
-  const res = await chrome.storage.local.get("remoteConfig");
-  return Object.assign({}, REMOTE_DEFAULTS, res.remoteConfig || {});
-}
-
-async function setRemoteConfig(patch) {
-  const cfg = Object.assign(await getRemoteConfig(), patch);
-  await chrome.storage.local.set({ remoteConfig: cfg });
-  return cfg;
-}
 
 // サービスワーカーが途中で眠らないよう、実行中は定期的に API を叩く。
 function startKeepAlive() {
@@ -198,150 +143,7 @@ async function sendToTabWithRetry(tabId, message, tries, intervalMs) {
   );
 }
 
-async function executeRelist(cmd) {
-  const stopKeepAlive = startKeepAlive();
-  const result = {
-    id: cmd.id || null,
-    type: cmd.type || null,
-    itemUrl: cmd.itemUrl || null,
-    startedAt: new Date().toISOString(),
-    status: "running",
-    steps: [],
-    error: null,
-  };
-  const saveResult = async () => {
-    await chrome.storage.local.set({ lastRemoteResult: result });
-    await setRemoteConfig({
-      lastStatus:
-        result.status + (result.error ? ": " + result.error : ""),
-    });
-  };
-  try {
-    if (!/^https:\/\/jp\.mercari\.com\/item\/[A-Za-z0-9]+/.test(cmd.itemUrl || "")) {
-      throw new Error("v0.5.0（検証版）の対象は Mercari 商品 URL のみです");
-    }
-    result.steps.push("商品ページを開く");
-    // v0.5.1: 商品ページも前面で開く。裏タブだと Chrome のスロットリングで
-    // ページ描画と画像の遅延読み込みが進まず、読み取りが止まってしまうため
-    // （実測: タブをクリックして前面に出すと進み始めた）。
-    const itemTab = await chrome.tabs.create({ url: cmd.itemUrl, active: true });
-    try {
-      await chrome.tabs.update(itemTab.id, { autoDiscardable: false });
-    } catch (e) {
-      /* noop */
-    }
-    await waitForTabComplete(itemTab.id, 45000);
-    await remoteSleep(3000); // SPA の描画待ち
 
-    result.steps.push("商品情報を読み取り中");
-    await saveResult();
-    const copyRes = await sendToTabWithRetry(
-      itemTab.id,
-      { type: "FurimaRemoteCopy" },
-      20,
-      3000
-    );
-    if (!copyRes || !copyRes.ok) {
-      throw new Error("読み取り失敗: " + ((copyRes && copyRes.error) || "不明なエラー"));
-    }
-    result.copy = copyRes.summary || null;
-    result.steps.push(
-      "読み取り完了: " + ((copyRes.summary && copyRes.summary.title) || "")
-    );
-    try {
-      await chrome.tabs.remove(itemTab.id);
-    } catch (e) {
-      /* noop */
-    }
-
-    result.steps.push("出品ページを開く");
-    const sellTab = await chrome.tabs.create({
-      url: "https://jp.mercari.com/sell/create",
-      active: true,
-    });
-    result.sellTabId = sellTab.id;
-    await waitForTabComplete(sellTab.id, 45000);
-    await remoteSleep(3500);
-
-    result.steps.push("フォームへ入力中");
-    await saveResult();
-    const fillRes = await sendToTabWithRetry(
-      sellTab.id,
-      { type: "FurimaRemoteFill" },
-      20,
-      3000
-    );
-    if (!fillRes || !fillRes.ok) {
-      throw new Error("入力失敗: " + ((fillRes && fillRes.error) || "不明なエラー"));
-    }
-    result.fillLines = fillRes.lines || null;
-    result.status = "filled";
-    result.steps.push("入力完了（出品ボタンは押していません）");
-  } catch (e) {
-    result.status = "error";
-    result.error = String((e && e.message) || e);
-    result.steps.push("エラー: " + result.error);
-  } finally {
-    result.finishedAt = new Date().toISOString();
-    await saveResult();
-    stopKeepAlive();
-  }
-  return result;
-}
-
-// 指令 JSON の解釈。素の JSON のほか、GitHub Gist API の返却形式
-// （{files: {"command.json": {content: "..."}}}) にも対応する。
-function parseCommandPayload(text) {
-  let obj = JSON.parse(text);
-  if (obj && typeof obj === "object" && obj.files) {
-    const f =
-      obj.files["command.json"] || Object.values(obj.files)[0];
-    if (f && f.content) obj = JSON.parse(f.content);
-  }
-  return obj;
-}
-
-async function pollRemoteCommands(reason) {
-  const cfg = await getRemoteConfig();
-  await setRemoteConfig({ lastPollAt: new Date().toISOString() });
-  if (!cfg.enabled || !cfg.cmdUrl) return { skipped: true, reason: reason || "" };
-  if (remoteRunning) return { busy: true };
-  let cmd;
-  try {
-    const res = await fetch(cfg.cmdUrl, { cache: "no-store" });
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    cmd = parseCommandPayload(await res.text());
-  } catch (e) {
-    await setRemoteConfig({
-      lastStatus: "指令取得エラー: " + String((e && e.message) || e),
-    });
-    return { error: true };
-  }
-  if (!cmd || cmd.type !== "relist" || !cmd.id || !cmd.itemUrl) {
-    return { noCommand: true };
-  }
-  if (cfg.lastCmdId === cmd.id) return { duplicate: true };
-  await setRemoteConfig({ lastCmdId: cmd.id, lastStatus: "実行中: " + cmd.id });
-  remoteRunning = true;
-  try {
-    await executeRelist(cmd);
-  } finally {
-    remoteRunning = false;
-  }
-  return { executed: cmd.id };
-}
-
-chrome.alarms.create(REMOTE_ALARM, { periodInMinutes: 1 });
-chrome.runtime.onInstalled.addListener(() => {
-  chrome.alarms.create(REMOTE_ALARM, { periodInMinutes: 1 });
-});
-chrome.runtime.onStartup.addListener(() => {
-  chrome.alarms.create(REMOTE_ALARM, { periodInMinutes: 1 });
-  pollRemoteCommands("startup");
-});
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === REMOTE_ALARM) pollRemoteCommands("alarm");
-});
 
 // ============================================================================
 // 画像の再取込（v0.7.13）
@@ -1407,7 +1209,6 @@ async function maybeAutoUpdateExtension(serverVersion) {
     if (compareVersions(serverVersion, own) <= 0) return;
     if (
       managerRunning ||
-      remoteRunning ||
       yahooRelistRun ||
       soldScanRunning ||
       yahooScanRunning ||
@@ -1819,6 +1620,9 @@ function restoreYahooScanAlarm() {
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.alarms.create(MANAGER_ALARM, { periodInMinutes: 1 });
+  // リモート指令の廃止に伴う後片付け（v0.12.31）: 旧アラームと設定を消す。
+  chrome.alarms.clear("fcRemotePoll");
+  chrome.storage.local.remove(["remoteConfig", "lastRemoteResult"]);
   restoreTodoScanAlarm();
   restoreYahooScanAlarm();
 });

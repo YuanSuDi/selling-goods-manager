@@ -74,7 +74,6 @@
     cursor: pointer;
   }
   .btn:hover { background: #e6e6e6; }
-  #remoteStatus { font-size: 11px; color: #666; line-height: 1.6; margin-top: 6px; white-space: pre-wrap; word-break: break-all; }
   #mgrStatus { font-size: 11px; color: #666; line-height: 1.6; margin-top: 6px; white-space: pre-wrap; word-break: break-all; }
   #yahooScanStatus { font-size: 11px; color: #666; line-height: 1.6; margin-top: 6px; white-space: pre-wrap; word-break: break-all; }
   input[type="password"] {
@@ -107,23 +106,6 @@
 
   <p class="note">※ 使い方：商品ページで「📋 この商品をコピー」→ 別サイトの出品ページで「📥 コピー内容を入力」ボタンを押すと、フォームに自動入力されます（送信はされません）。</p>
 
-  <hr>
-  <h2>リモート指令（v0.5.0 検証版）</h2>
-  <div class="row">
-    <input type="checkbox" id="remoteEnabled">
-    <label for="remoteEnabled">リモート指令を受け付ける</label>
-  </div>
-  <input type="url" id="remoteCmdUrl" placeholder="指令 JSON の URL（Gist の api.github.com/gists/... など）">
-  <div class="row">
-    <button class="btn" id="remoteSave" type="button">設定を保存</button>
-    <button class="btn" id="remotePollNow" type="button">今すぐチェック</button>
-  </div>
-  <input type="url" id="remoteTestUrl" placeholder="テスト用：Mercari 商品 URL">
-  <div class="row">
-    <button class="btn" id="remoteTest" type="button">テスト実行（読み取り→出品ページ入力）</button>
-  </div>
-  <div id="remoteStatus"></div>
-  <p class="note">※ リモート実行でも出品ボタンは押しません。入力された出品ページが前面に開くので、内容を確認して自分で出品してください。</p>
 
   <hr>
   <h2>出品管理プログラム連携（v0.9.0）</h2>

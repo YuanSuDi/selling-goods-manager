@@ -67,66 +67,6 @@
     render();
   });
 
-  // ---- リモート指令（v0.5.0） ---------------------------------------------
-  const remoteEls = {
-    enabled: document.getElementById("remoteEnabled"),
-    cmdUrl: document.getElementById("remoteCmdUrl"),
-    status: document.getElementById("remoteStatus"),
-    testUrl: document.getElementById("remoteTestUrl"),
-  };
-
-  async function renderRemote() {
-    const res = await chrome.storage.local.get(["remoteConfig", "lastRemoteResult"]);
-    const cfg = res.remoteConfig || {};
-    remoteEls.enabled.checked = !!cfg.enabled;
-    if (document.activeElement !== remoteEls.cmdUrl) {
-      remoteEls.cmdUrl.value = cfg.cmdUrl || "";
-    }
-    const lines = [];
-    lines.push("状態: " + (cfg.lastStatus || "未設定"));
-    if (cfg.lastPollAt) {
-      lines.push("最終チェック: " + new Date(cfg.lastPollAt).toLocaleString("ja-JP"));
-    }
-    const r = res.lastRemoteResult;
-    if (r) {
-      lines.push(
-        "最終指令: " + (r.id || "") + " / " + r.status +
-        (r.copy ? " / " + (r.copy.title || "") + "（画像" + r.copy.imageCount + "枚）" : "") +
-        (r.error ? " / " + r.error : "")
-      );
-    }
-    remoteEls.status.textContent = lines.join("\n");
-  }
-
-  document.getElementById("remoteSave").addEventListener("click", async () => {
-    const res = await chrome.storage.local.get("remoteConfig");
-    const cfg = Object.assign({}, res.remoteConfig || {}, {
-      enabled: remoteEls.enabled.checked,
-      cmdUrl: remoteEls.cmdUrl.value.trim(),
-    });
-    await chrome.storage.local.set({ remoteConfig: cfg });
-    renderRemote();
-  });
-
-  document.getElementById("remotePollNow").addEventListener("click", () => {
-    remoteEls.status.textContent = "チェック中…";
-    chrome.runtime.sendMessage({ type: "FurimaRemotePollNow" }, () => {
-      setTimeout(renderRemote, 800);
-    });
-  });
-
-  document.getElementById("remoteTest").addEventListener("click", () => {
-    const url = remoteEls.testUrl.value.trim();
-    if (!url) {
-      remoteEls.status.textContent = "テスト用 URL を入力してください";
-      return;
-    }
-    remoteEls.status.textContent = "テスト実行中…（商品ページ→出品ページの順に開きます）";
-    chrome.runtime.sendMessage({ type: "FurimaRemoteTest", itemUrl: url }, () => {
-      setTimeout(renderRemote, 800);
-    });
-  });
-
   // ---- 出品管理プログラム連携（v0.9.0） -----------------------------------
   const mgrEls = {
     enabled: document.getElementById("mgrEnabled"),
@@ -297,6 +237,5 @@
   });
 
   render();
-  renderRemote();
   renderManager();
 })();
