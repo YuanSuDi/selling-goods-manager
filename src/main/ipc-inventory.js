@@ -139,7 +139,7 @@ function registerInventoryIpc(ctx) {
   // なる）。値が同じでも判定は走らせる（再判定の受け皿）。
   ipcMain.on('listing_set_state', async (e, data) => {
     const state = (data || {}).state
-    if (!['live', 'sold', 'unlisted', 'unknown'].includes(state)) {
+    if (!['live', 'sold', 'unlisted', 'unknown', 'paused'].includes(state)) {
       e.sender.send('listing_result', { ok: false, error: '状態の値が不正です。' })
       return
     }

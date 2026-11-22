@@ -360,6 +360,9 @@ function createManagerServer(options) {
           message: body.message || null,
           // 下架タスク専用: Yahoo で入札があり自動取消しを中止した印。
           hasBids: !!body.hasBids,
+          // 下架タスク専用: Mercari は削除ではなく一時停止になった印
+          // （ID を保持するため、レコード側の反映が変わる）。
+          paused: !!body.paused,
           at: new Date().toISOString(),
           executedBy: reqNodeId,
         };

@@ -358,6 +358,24 @@ function startManagerServer() {
     const isDefaultRecord = record.condition_id === defaultConditionId
     const now = new Date().toISOString()
     if (task.result && task.result.ok) {
+      if (task.result.paused) {
+        // Mercari の一時停止: 出品は止まったがリンク自体は生きており、
+        // 次に売るとき同じ ID を辿れるよう listing_id は保持する。
+        await inventory.updateListing(record._id, {
+          listing_state: 'paused',
+          state_at: now,
+          error: null,
+          status: 'active',
+        })
+        if (isDefaultRecord) {
+          db.update(
+            { product_no: record.product_no },
+            { $set: { [bind.errorField]: null } },
+            () => refreshRenderer()
+          )
+        } else refreshRenderer()
+        return
+      }
       await inventory.updateListing(record._id, {
         listing_id: null,
         listing_state: 'unlisted',
@@ -660,7 +678,10 @@ function startManagerServer() {
       // ズレていたら「出品中」へ戻す。下架判定は状態が既に合って
       // いても毎回走らせる（前回の判定が手動エントリに化けた後の
       // 再クリック＝再判定の受け皿にするため）。
-      if (record.listing_state !== 'live') {
+      // ただし「一時停止」は意図的に止めた状態で、停止中でも商品
+      // ページには出品者コントロールが見えて所有権は確認できて
+      // しまう。確認できたからといって「出品中」へは戻さない。
+      if (record.listing_state !== 'live' && record.listing_state !== 'paused') {
         await inventory.updateListing(record._id, {
           listing_state: 'live',
           state_at: new Date().toISOString(),
@@ -676,7 +697,7 @@ function startManagerServer() {
     if (record.node_id) return { ok: true, assigned: false, conflict: true }
     await inventory.updateListing(record._id, {
       node_id: claim.nodeId,
-      listing_state: 'live',
+      listing_state: record.listing_state === 'paused' ? 'paused' : 'live',
       listed_at: record.listed_at || new Date().toISOString(),
       state_at: new Date().toISOString(),
     })

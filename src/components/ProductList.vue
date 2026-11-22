@@ -324,7 +324,7 @@
 
   // ---- 出品レコード編集モーダル ----
   // 出品状態の表示名。出品中はタグに付けない（従来表示のまま）。
-  const LISTING_STATE_LABELS = { sold: '販売済', unlisted: '未出品', unknown: '要確認' };
+  const LISTING_STATE_LABELS = { sold: '販売済', unlisted: '未出品', unknown: '要確認', paused: '一時停止' };
   const listingStateLabel = (r) =>
     r && r.listing_state && r.listing_state !== 'live'
       ? LISTING_STATE_LABELS[r.listing_state] || ''
@@ -335,6 +335,7 @@
     { value: 'live', label: '状態：出品中' },
     { value: 'sold', label: '状態：販売済' },
     { value: 'unlisted', label: '状態：未出品' },
+    { value: 'paused', label: '状態：一時停止' },
     { value: 'unknown', label: '状態：要確認' },
   ];
   // 手動下架の未処理エントリがある商品は行に印を出す。
