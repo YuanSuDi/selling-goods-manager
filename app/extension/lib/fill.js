@@ -449,29 +449,52 @@
   // を繰り返して順番を確定させる。1 枚目で痕跡が無ければ handled:false
   // を返し、呼び出し側が従来の一括方式に切り替える。
   async function attachIncrementally(input, files) {
+    // v0.12.32 改修: 初版は最初に掴んだ input を全枚で使い回していたが、
+    // Yahoo! では 1 枚目の取り込み後に input 要素が作り直されるらしく、
+    // 2 枚目以降が空振りして 1 枚しか付かなかった（2026-11-22 実測）。
+    // そこで毎回 input を引き直し、プレビュー src の累積集合で痕跡を
+    // 数える（前の枚の遅れて出たプレビューを次の枚の痕跡と誤認しない）。
+    // 痕跡が無い枚は input を引き直して 1 回だけ再試行する。
+    const findCurrentMulti = () =>
+      Array.from(document.querySelectorAll('input[type="file"]')).find(
+        (el) => el.multiple
+      ) || input;
     let failed = 0;
+    let attachedCount = 0;
     let missed = 0;
+    const seen = snapshotImgSrcs();
     for (let i = 0; i < files.length; i++) {
-      const before = snapshotImgSrcs();
-      try {
-        setFilesOnInput(input, [files[i]]);
-      } catch (e) {
-        failed++;
-        console.warn(LOG, "attachImages: incremental setFiles failed for file", i, e);
-        continue;
+      let ok = false;
+      for (let attempt = 0; attempt < 2 && !ok; attempt++) {
+        const target = findCurrentMulti();
+        try {
+          setFilesOnInput(target, [files[i]]);
+        } catch (e) {
+          failed++;
+          console.warn(LOG, "attachImages: incremental setFiles failed for file", i, e);
+          break;
+        }
+        ok = await waitForAttachEvidence(seen, target, 10000);
+        console.log(
+          LOG, "attachImages: incremental file", i, "attempt", attempt, "evidence:", ok
+        );
+        if (ok) {
+          snapshotImgSrcs().forEach((src) => seen.add(src));
+        }
       }
-      const ok = await waitForAttachEvidence(before, input, 8000);
-      console.log(LOG, "attachImages: incremental file", i, "evidence:", ok);
       if (!ok) {
         if (i === 0 && failed === 0) {
           return { handled: false, attached: 0, failed: 0, unverified: false };
         }
         missed++;
+      } else {
+        attachedCount++;
+        await sleep(700); // アップローダの後処理を待ってから次へ
       }
     }
     return {
       handled: true,
-      attached: files.length - failed,
+      attached: attachedCount,
       failed,
       unverified: missed > 0,
     };

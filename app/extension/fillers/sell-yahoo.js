@@ -109,21 +109,43 @@
         .map((lab) => FF.normalizeText(lab.textContent || ""))
         .join("|")
         .slice(0, 400);
+    // 「このカテゴリに出品」の探索（v0.12.32 で拡張）。このページは
+    // タブもツリー行も全部 <a href="javascript:void(0)"> で作られており、
+    // 確定ボタンも button/input ではなくリンク等の可能性がある。
+    // v0.12.31 までは button/input しか探しておらず、葉まで辿れても
+    // ボタンが見つからず押せなかった。文言はページ内で一意なので、
+    // 可視要素全般から完全一致で探してよい。
     const findConfirmButton = () => {
-      const btns = Array.from(
-        document.querySelectorAll('button, input[type="submit"], input[type="button"]')
-      ).filter(
-        (b) =>
-          FF.isVisible(b) &&
-          !b.disabled &&
-          FF.normalizeText(b.textContent || b.value || "").includes("このカテゴリに出品")
+      const els = Array.from(
+        document.querySelectorAll(
+          'a, button, input[type="submit"], input[type="button"], [role="button"], div, span'
+        )
+      ).filter((b) => {
+        if (!FF.isVisible(b) || b.disabled) return false;
+        const t = FF.normalizeText(b.textContent || b.value || "");
+        return t === "このカテゴリに出品";
+      });
+      // 子要素（span 等）より操作要素そのものを優先する
+      const direct = els.find((b) =>
+        /^(A|BUTTON|INPUT)$/.test(b.tagName) || b.getAttribute("role") === "button"
       );
-      return btns[0] || null;
+      return direct || els[0] || null;
     };
     const clickConfirmButton = async () => {
       const confirmBtn = await FF.waitFor(findConfirmButton, 6000, 250);
       if (!confirmBtn) return false;
       realClick(confirmBtn);
+      // 押せていればボタンは消える（フォームへ戻る）。残っていたら
+      // ネイティブ click でもう一度だけ試す。最終判定はフォーム側の
+      // 照合に委ねる（従来どおり）。
+      const gone = await FF.waitFor(
+        () => (findConfirmButton() ? null : true),
+        3000,
+        250
+      );
+      if (!gone) {
+        try { confirmBtn.click(); } catch (e) { /* フォーム側で検証する */ }
+      }
       return true;
     };
     const selectHit = async (hit) => {
