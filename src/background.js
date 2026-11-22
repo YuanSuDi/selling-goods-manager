@@ -281,6 +281,7 @@ function startManagerServer() {
           status: 'active',
           node_id: bornNode,
           listing_state: 'live',
+          fresh_listing: true,
           listed_at: new Date().toISOString(),
           state_at: new Date().toISOString(),
         }
@@ -323,6 +324,7 @@ function startManagerServer() {
         status: 'active',
         node_id: bornNode,
         listing_state: 'live',
+        fresh_listing: true,
         listed_at: new Date().toISOString(),
         state_at: new Date().toISOString(),
       })
@@ -554,6 +556,7 @@ function startManagerServer() {
     }
     if (isCurrentListing) {
       saleSet.listing_state = 'sold'
+      saleSet.fresh_listing = false
       saleSet.state_at = new Date().toISOString()
     }
     const guard = await dbUpdate(
@@ -1059,13 +1062,21 @@ async function createWindow() {
       refreshRenderer()
       // 出品状態と自動下架: 売れたレコードが分かっていれば「販売済み」に
       // し、下架判定は在庫0になったときこそ必要なので補充判定より先に走らせる。
+      // ただし再出品直後（fresh_listing）のレコードへの手動記帳は、旧リンク
+      // 分の売却のまとめ記帳であることがほとんどで、現在のリンクは生きて
+      // いる。状態を「販売済」にすると下架判定から消えてしまう（A342）ため、
+      // その場合は記帳だけ行い、状態と補充には触らない。
       if (inventory && data.record_id) {
-        await inventory
-          .updateListing(data.record_id, {
-            listing_state: 'sold',
-            state_at: new Date().toISOString(),
-          })
-          .catch(() => {})
+        const rec = await inventory.getListing(data.record_id).catch(() => null)
+        if (!(rec && rec.fresh_listing)) {
+          await inventory
+            .updateListing(data.record_id, {
+              listing_state: 'sold',
+              fresh_listing: false,
+              state_at: new Date().toISOString(),
+            })
+            .catch(() => {})
+        }
       }
       if (inventory) {
         try {
@@ -1087,7 +1098,7 @@ async function createWindow() {
         } else if (condRecords.length === 1) {
           target = condRecords[0]
         }
-        if (target && target.auto_restock) {
+        if (target && target.auto_restock && !target.fresh_listing) {
           const newRecordSold = Number(target.sold_count || 0) + 1
           await inventory.updateListing(target._id, {
             sold_count: newRecordSold,
