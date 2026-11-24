@@ -359,6 +359,21 @@
   const refTotalSold = computed(() =>
     conditions.value.reduce((sum, c) => sum + conditionSold(refDetailProduct.value, c._id), 0)
   );
+  // 参照ツリーに出す状態は「レコードあり / 在庫あり / 販売あり」のものだけ。
+  // 空の状態は出さない（追加は上部の「レコード追加」から状態を選んで行う）。
+  const visibleRefConditions = computed(() => {
+    const p = refDetailProduct.value;
+    if (!p) return [];
+    return conditions.value.filter(
+      (c) =>
+        recordsForCondition(p.product_no, c._id).length > 0 ||
+        conditionStock(p, c._id) > 0 ||
+        conditionSold(p, c._id) > 0
+    );
+  });
+  const conditionOptions = computed(() =>
+    conditions.value.map((c) => ({ value: c._id, label: c.name }))
+  );
   // 手動下架の未処理エントリがある商品は行に印を出す。
   const hasManualDelist = (productNo) =>
     (taskList.value || []).some(
@@ -368,6 +383,7 @@
   const listingEdit = reactive({
     id: null, product_no: '', condition_id: null, platform: 'mercari',
     listing: '', node_id: '', auto_restock: true, auto_delist: false, quota: null,
+    listing_state: 'live',
   });
   const openListingEdit = (record, conditionId) => {
     if (record) {
@@ -383,7 +399,11 @@
     } else {
       listingEdit.id = null
       listingEdit.product_no = refDetailProductNo.value
-      listingEdit.condition_id = conditionId
+      listingEdit.condition_id =
+        conditionId ||
+        (conditions.value.find((c) => c.isDefault) || conditions.value[0] || {})._id ||
+        null
+      listingEdit.listing_state = 'live'
       listingEdit.platform = 'mercari'
       listingEdit.listing = ''
       listingEdit.node_id = ''
@@ -404,6 +424,7 @@
       auto_restock: listingEdit.auto_restock,
       auto_delist: listingEdit.auto_delist,
       quota: listingEdit.quota === '' ? null : listingEdit.quota,
+      listing_state: listingEdit.id ? undefined : listingEdit.listing_state,
     })
     listingEditFlag.value = false
   };
@@ -600,10 +621,13 @@
       <div class="ref-tree">
         <div class="tree-root">
           <span>{{ refDetailProduct.product_no }} {{ refDetailProduct.product_name }}</span>
-          <span class="ref-detail-stock">総在庫 {{ refTotalStock }} / 総販売 {{ refTotalSold }}</span>
         </div>
-        <div class="tree-children">
-          <div v-for="cond in conditions" :key="cond._id" class="tree-cond">
+        <div class="tree-root-sub">
+          <span class="ref-detail-stock">総在庫 {{ refTotalStock }} / 総販売 {{ refTotalSold }}</span>
+          <a-button size="small" type="primary" style="margin-left: auto;" @click="openListingEdit(null)">レコード追加</a-button>
+        </div>
+        <div v-if="visibleRefConditions.length" class="tree-children">
+          <div v-for="cond in visibleRefConditions" :key="cond._id" class="tree-cond">
             <div class="tree-cond-row">
               <a-button size="small" type="text" class="tree-toggle" @click="toggleCond(cond._id)">{{ collapsedConds[cond._id] ? '▸' : '▾' }}</a-button>
               <span class="ref-detail-name">
@@ -611,7 +635,6 @@
                 <a-tag v-if="cond.isDefault" color="default">既定</a-tag>
               </span>
               <span class="ref-detail-stock">在庫 {{ conditionStock(refDetailProduct, cond._id) }} / 販売 {{ conditionSold(refDetailProduct, cond._id) }}</span>
-              <a-button size="small" style="margin-left: auto;" @click="openListingEdit(null, cond._id)">レコード追加</a-button>
             </div>
             <div v-if="!collapsedConds[cond._id]" class="tree-children">
               <div
@@ -661,6 +684,7 @@
             </div>
           </div>
         </div>
+        <div v-else class="tree-empty-note">レコードも在庫もありません。「レコード追加」から登録できます。</div>
       </div>
     </template>
   </a-modal>
@@ -708,11 +732,26 @@
           :options="[{ value: 'mercari', label: 'メルカリ' }, { value: 'yahoo', label: 'ヤフオク' }]"
         />
       </a-form-item>
+      <a-form-item v-if="!listingEdit.id" label="状態">
+        <a-select v-model:value="listingEdit.condition_id" :options="conditionOptions" />
+      </a-form-item>
       <a-form-item label="商品リンクまたはID">
         <a-input v-model:value="listingEdit.listing" placeholder="例：https://jp.mercari.com/item/m12345678901 / w123456789" />
       </a-form-item>
       <a-form-item label="ノード（ブラウザ）">
         <a-select v-model:value="listingEdit.node_id" :options="nodeOptions" />
+      </a-form-item>
+      <a-form-item v-if="!listingEdit.id" label="出品状態（売れたリンクの保存用は「販売済」）">
+        <a-select
+          v-model:value="listingEdit.listing_state"
+          :options="[
+            { value: 'live', label: '出品中' },
+            { value: 'sold', label: '販売済' },
+            { value: 'unlisted', label: '未出品' },
+            { value: 'paused', label: '一時停止' },
+            { value: 'unknown', label: '要確認' },
+          ]"
+        />
       </a-form-item>
       <a-form-item label="自動補充">
         <a-switch v-model:checked="listingEdit.auto_restock" />
@@ -831,7 +870,17 @@
   align-items: center;
   gap: 10px;
   font-weight: 600;
-  padding: 2px 0 6px;
+  padding: 2px 0 0;
+}
+.tree-root-sub {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 2px 0 8px;
+}
+.tree-empty-note {
+  color: #b6bcc6;
+  padding: 6px 0 2px;
 }
 .tree-children {
   margin-left: 9px;

@@ -576,7 +576,6 @@
         chrome.storage.local.set({
           fcLastShipDiag: { at: new Date().toISOString(), method, ok, diag: d },
         });
-        if (!ok) chrome.runtime.sendMessage({ type: "FurimaShowShipDiag" });
       } catch (e) { /* 診断の保存失敗は本処理に影響させない */ }
       return { ok, diag: d };
     };

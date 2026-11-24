@@ -41,12 +41,6 @@ async function fetchWithFallbacks(url, referrer) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  // 配送方法の自動選択が失敗したとき、診断タブを開く（v0.12.36 ローカル検証用）。
-  // ポップアップはフォーカスを失うと閉じてしまうため、タブで残す。
-  if (message && message.type === "FurimaShowShipDiag") {
-    chrome.tabs.create({ url: chrome.runtime.getURL("diag.html") });
-    return false;
-  }
   // 出品ページで画像の取込データが無かったときの取り直し（filler からの依頼、v0.7.13）。
   if (message && message.type === "FurimaRecaptureImages" && message.itemUrl) {
     recaptureImages(message.itemUrl).then((r) => sendResponse(r));

@@ -308,7 +308,9 @@ function createInventoryV2(dbs) {
       status: 'active',
       error: null,
       last_processed_sale_item_id: null,
-      listing_state: 'live',
+      listing_state: ['live', 'sold', 'unlisted', 'paused', 'unknown'].includes(data.listing_state)
+        ? data.listing_state
+        : 'live',
       listed_at: now,
       state_at: now,
       createdAt: now,
