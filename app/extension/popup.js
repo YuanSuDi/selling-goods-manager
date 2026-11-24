@@ -14,6 +14,26 @@
   async function render() {
     const emptyEl = document.getElementById("empty");
     const itemEl = document.getElementById("item");
+
+    // 版表示：いま読み込まれている拡張の版＋管理プログラムが配置した版。
+    const ownVersion = chrome.runtime.getManifest().version;
+    const verEl = document.getElementById("extVersion");
+    if (verEl) verEl.textContent = "v" + ownVersion;
+    const mgrVerEl = document.getElementById("mgrVersion");
+    if (mgrVerEl) {
+      const stored = await chrome.storage.local.get("fcMgrExtVersion");
+      const mgrVer = stored && stored.fcMgrExtVersion;
+      if (mgrVer) {
+        if (mgrVer === ownVersion) {
+          mgrVerEl.textContent = "管理プログラム配置版： v" + mgrVer + "（一致）";
+        } else {
+          mgrVerEl.textContent =
+            "管理プログラム配置版： v" + mgrVer + "（この拡張は v" + ownVersion + "）";
+          mgrVerEl.style.color = "#d4380d";
+        }
+      }
+    }
+
     const data = await window.FurimaCopy.load();
 
     if (!data) {

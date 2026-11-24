@@ -1258,6 +1258,8 @@ const EXT_UPDATE_KEY = "fcExtAutoUpdate";
 async function maybeAutoUpdateExtension(serverVersion) {
   try {
     if (!serverVersion) return;
+    // ポップアップで「配置済みの版」を表示できるよう、最後に見た版を残す。
+    await chrome.storage.local.set({ fcMgrExtVersion: serverVersion });
     const own = chrome.runtime.getManifest().version;
     if (compareVersions(serverVersion, own) <= 0) return;
     if (
