@@ -236,6 +236,19 @@
     }
   });
 
+  // ---- 配送方法の自動選択の診断（v0.12.35 ローカル検証用） ---------------
+  async function renderShipDiag() {
+    const el = document.getElementById("shipDiag");
+    if (!el) return;
+    const res = await chrome.storage.local.get("fcLastShipDiag");
+    const d = res.fcLastShipDiag;
+    if (!d) return;
+    el.textContent =
+      (d.ok ? "成功" : "失敗") + " / " + (d.method || "") + " / " +
+      new Date(d.at).toLocaleString("ja-JP") + "\n" + d.diag;
+  }
+
   render();
   renderManager();
+  renderShipDiag();
 })();

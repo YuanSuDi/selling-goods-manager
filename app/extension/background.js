@@ -41,6 +41,12 @@ async function fetchWithFallbacks(url, referrer) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // 配送方法の自動選択が失敗したとき、診断タブを開く（v0.12.36 ローカル検証用）。
+  // ポップアップはフォーカスを失うと閉じてしまうため、タブで残す。
+  if (message && message.type === "FurimaShowShipDiag") {
+    chrome.tabs.create({ url: chrome.runtime.getURL("diag.html") });
+    return false;
+  }
   // 出品ページで画像の取込データが無かったときの取り直し（filler からの依頼、v0.7.13）。
   if (message && message.type === "FurimaRecaptureImages" && message.itemUrl) {
     recaptureImages(message.itemUrl).then((r) => sendResponse(r));
@@ -1138,8 +1144,13 @@ async function executeYahooDelistTask(cfg, task) {
     }
     await waitForTabComplete(tabId, 45000);
     await remoteSleep(1800);
-    // 確認画面/モーダルで取り消しを確定する（キャンセル・戻るは押さない）。
-    const confirmed = await chrome.scripting
+    // 確認モーダル（実機 2026-11-23、ユーザー提示）: 「オークションの
+    // 取り消し」モーダルでは「オプション利用料等の説明を確認した」に
+    // チェックを入れるまで「出品を取り消す」が無効（グレー）のまま。
+    // 旧実装は無効なボタンを押して成功扱いにし、検証で失敗していた
+    // （＝マネージャ側の「取消しを確認できませんでした」の正体）。
+    // チェック → 有効化を待って押す、の順。キャンセル系は絶対に押さない。
+    const feeState = await chrome.scripting
       .executeScript({
         target: { tabId },
         func: () => {
@@ -1147,22 +1158,70 @@ async function executeYahooDelistTask(cfg, task) {
             const s = getComputedStyle(el);
             return s.display !== "none" && s.visibility !== "hidden" && el.getClientRects().length > 0;
           };
-          const cands = Array.from(
-            document.querySelectorAll('button, a, [role="button"], input[type="submit"]')
-          ).filter(visible);
-          const hit = cands.find((el) => {
-            const t = String(el.innerText || el.value || "").replace(/\s+/g, " ").trim();
-            if (/キャンセル|やめる|戻る|取り消さない/.test(t)) return false;
-            return /^(取り消しする|出品を取り消す|取り消す|この出品を取り消す)$/.test(t);
-          });
-          if (!hit) return false;
-          hit.click();
-          return true;
+          const labels = Array.from(document.querySelectorAll("label")).filter(visible);
+          const lab = labels.find((el) =>
+            String(el.innerText || "").includes("オプション利用料等の説明を確認した")
+          );
+          let box = null;
+          if (lab) {
+            box = lab.querySelector('input[type="checkbox"]');
+            if (!box && lab.htmlFor) box = document.getElementById(lab.htmlFor);
+          }
+          if (!box) {
+            box =
+              Array.from(document.querySelectorAll('input[type="checkbox"]'))
+                .filter(visible)
+                .find((el) => {
+                  const row = el.closest("label, div, p, li");
+                  return (
+                    row &&
+                    String(row.innerText || "").includes("オプション利用料等の説明を確認した")
+                  );
+                }) || null;
+          }
+          if (!box) return "notfound";
+          if (!box.checked) {
+            box.click();
+            if (!box.checked && lab) lab.click();
+          }
+          return box.checked ? "checked" : "unchecked";
         },
       })
-      .then((r) => !!(r[0] && r[0].result))
-      .catch(() => false);
-    if (!confirmed) throw new Error("取り消しの確認ボタンが見つかりませんでした");
+      .then((r) => (r[0] && r[0].result) || "notfound")
+      .catch(() => "notfound");
+    if (feeState === "unchecked") {
+      throw new Error("オプション利用料の確認チェックを入れられませんでした");
+    }
+    // 「出品を取り消す」が有効になるまで待って押す（最大 ~6 秒ポーリング）。
+    let confirmed = false;
+    for (let attempt = 0; attempt < 8 && !confirmed; attempt++) {
+      confirmed = await chrome.scripting
+        .executeScript({
+          target: { tabId },
+          func: () => {
+            const visible = (el) => {
+              const s = getComputedStyle(el);
+              return s.display !== "none" && s.visibility !== "hidden" && el.getClientRects().length > 0;
+            };
+            const cands = Array.from(
+              document.querySelectorAll('button, a, [role="button"], input[type="submit"]')
+            ).filter(visible);
+            const hit = cands.find((el) => {
+              const t = String(el.innerText || el.value || "").replace(/\s+/g, " ").trim();
+              if (/キャンセル|やめる|戻る|取り消さない/.test(t)) return false;
+              return /^(取り消しする|出品を取り消す|取り消す|この出品を取り消す)$/.test(t);
+            });
+            if (!hit) return false;
+            if (hit.disabled || hit.getAttribute("aria-disabled") === "true") return false;
+            hit.click();
+            return true;
+          },
+        })
+        .then((r) => !!(r[0] && r[0].result))
+        .catch(() => false);
+      if (!confirmed) await remoteSleep(800);
+    }
+    if (!confirmed) throw new Error("取り消しの確認ボタンが見つからないか、有効になりませんでした");
     await remoteSleep(2500);
     // 検証: 出品中一覧から消えていること。
     const stillListed = await scanSellingListForItem(tabId, itemId);
@@ -1271,6 +1330,7 @@ async function pollManagerTasks(why) {
   managerRunning = true;
   try {
     if (task.type === "verify") await executeVerifyTask(cfg, task);
+    else if (task.type === "healthscan") await executeHealthScanTask(cfg, task);
     else if (task.type === "delist" && task.platform === "yahoo")
       await executeYahooDelistTask(cfg, task);
     else if (task.type === "delist") await executeMercariDelistTask(cfg, task);
@@ -2217,6 +2277,224 @@ async function scanSellingListEntries(tabId) {
     await remoteSleep(800);
   }
   return Array.from(byId.values());
+}
+
+// 出品中一覧の全ページ走査（完全性つき）。scanSellingListEntries と
+// 同じ歩き方だが、ページ上限に達して次ページが残っていた場合は
+// complete=false を返す。绑定体检は「完全な一覧で見当たらない」
+// ことをもって初めてレコードの死を疑うため、この区別が要る。
+async function scanSellingListEntriesEx(tabId) {
+  await chrome.tabs.update(tabId, {
+    url: "https://auctions.yahoo.co.jp/my/selling",
+    active: true,
+  });
+  if (!(await waitForTabComplete(tabId, 45000))) return null;
+  await remoteSleep(1200);
+  const byId = new Map();
+  let complete = false;
+  for (let page = 0; page < 10; page++) {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const links = Array.from(document.querySelectorAll("a[href]"));
+        const entries = [];
+        let nextUrl = null;
+        for (const a of links) {
+          try {
+            const u = new URL(a.href, location.href);
+            const m = u.pathname.match(/^\/jp\/auction\/([a-zA-Z]?\d+)$/);
+            if (m) {
+              entries.push({
+                id: m[1],
+                title: String(a.innerText || "").replace(/\s+/g, " ").trim(),
+              });
+            }
+          } catch (e) {
+            /* 解析できないリンクは無視する */
+          }
+        }
+        for (const a of links) {
+          const label = (a.innerText || a.getAttribute("aria-label") || "")
+            .replace(/\s+/g, " ")
+            .trim();
+          try {
+            const u = new URL(a.href, location.href);
+            if (
+              u.pathname === "/my/selling" &&
+              u.href !== location.href &&
+              /^(次へ|次のページ|›|»)/.test(label)
+            ) {
+              nextUrl = u.href;
+              break;
+            }
+          } catch (e) {
+            /* 解析できないリンクは無視する */
+          }
+        }
+        return { entries, nextUrl };
+      },
+    });
+    const r = results[0] && results[0].result;
+    if (!r) return null;
+    for (const e of r.entries) {
+      const prev = byId.get(e.id);
+      if (!prev || (e.title && e.title.length > (prev.title || "").length)) {
+        byId.set(e.id, e);
+      }
+    }
+    if (!r.nextUrl) {
+      complete = true;
+      break;
+    }
+    if (page === 9) break; // 上限到達・次ページあり = 不完全
+    await chrome.tabs.update(tabId, { url: r.nextUrl, active: true });
+    if (!(await waitForTabComplete(tabId, 45000))) break;
+    await remoteSleep(800);
+  }
+  return { entries: Array.from(byId.values()), complete };
+}
+
+// Mercari の出品中一覧（マイページ）をスクロールしながら全件集める。
+// 一覧は無限スクロール前提で、件数が 2 ラウンド連続で増えなければ
+// 最後まで来たとみなす。0 件のときは「本当に 0 件」か「ページを
+// 読めていない」か区別できないため complete=false に倒す
+// （誤って全レコードを死扱いしないための安全弁）。
+async function scanMercariLiveListings(tabId) {
+  const byId = new Map();
+  let stableRounds = 0;
+  let complete = false;
+  for (let round = 0; round < 40; round++) {
+    const results = await chrome.scripting
+      .executeScript({
+        target: { tabId },
+        func: () => {
+          const out = [];
+          for (const a of document.querySelectorAll("a[href]")) {
+            let u;
+            try {
+              u = new URL(a.href, location.href);
+            } catch (e) {
+              continue;
+            }
+            const m = u.pathname.match(/^\/item\/(m[A-Za-z0-9]+)$/);
+            if (!m) continue;
+            const img = a.querySelector("img");
+            const title = String(
+              a.getAttribute("aria-label") || a.innerText || (img && img.alt) || ""
+            )
+              .replace(/\s+/g, " ")
+              .trim();
+            out.push({ id: m[1], title });
+          }
+          window.scrollTo(0, document.body.scrollHeight);
+          return out;
+        },
+      })
+      .catch(() => null);
+    const entries = results && results[0] && results[0].result;
+    if (!entries) return null;
+    const before = byId.size;
+    for (const e of entries) {
+      const prev = byId.get(e.id);
+      if (!prev || (e.title && e.title.length > (prev.title || "").length)) {
+        byId.set(e.id, e);
+      }
+    }
+    if (byId.size === before) {
+      stableRounds += 1;
+      if (stableRounds >= 2) {
+        complete = byId.size > 0;
+        break;
+      }
+    } else {
+      stableRounds = 0;
+    }
+    await remoteSleep(1100);
+  }
+  return { entries: Array.from(byId.values()), complete };
+}
+
+// 绑定体检タスク: このブラウザ（ノード）の在售リストを列挙して
+// 管理プログラムへ返す。対照と異常判定は管理プログラム側で行う。
+// ここでは「見えたものを正直に返す」だけ: 取り切れなかった場合は
+// complete=false を付け、失敗は失敗として報告する。
+async function executeHealthScanTask(cfg, task) {
+  const stopKeepAlive = startKeepAlive();
+  let tabId = null;
+  const postResult = async (ok, message, scan) => {
+    try {
+      await managerFetch(cfg, "/api/tasks/" + encodeURIComponent(task.id) + "/result", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ok: !!ok,
+          message: message || null,
+          scan: scan || null,
+        }),
+      });
+    } catch (e) {
+      console.warn("[FurimaCopy] health scan result post failed", e);
+    }
+  };
+  try {
+    await managerFetch(cfg, "/api/tasks/" + encodeURIComponent(task.id) + "/claim", {
+      method: "POST",
+    });
+    await setManagerConfig({
+      lastStatus: "绑定体检スキャン中: " + (task.platform || ""),
+    });
+    let scan = null;
+    if (task.platform === "yahoo") {
+      const tab = await chrome.tabs.create({
+        url: "https://auctions.yahoo.co.jp/my/selling",
+        active: false,
+      });
+      tabId = tab.id;
+      try {
+        await chrome.tabs.update(tabId, { autoDiscardable: false });
+      } catch (e) {
+        /* noop */
+      }
+      await waitForTabComplete(tabId, 45000);
+      scan = await scanSellingListEntriesEx(tabId);
+    } else {
+      const tab = await chrome.tabs.create({
+        url: "https://jp.mercari.com/mypage/listings",
+        active: false,
+      });
+      tabId = tab.id;
+      try {
+        await chrome.tabs.update(tabId, { autoDiscardable: false });
+      } catch (e) {
+        /* noop */
+      }
+      await waitForTabComplete(tabId, 45000);
+      await remoteSleep(2500);
+      scan = await scanMercariLiveListings(tabId);
+    }
+    if (!scan) throw new Error("出品中一覧を取得できませんでした");
+    await postResult(
+      true,
+      "在售 " + scan.entries.length + " 件" + (scan.complete ? "" : "（不完全なスキャン）"),
+      { complete: scan.complete, items: scan.entries }
+    );
+    await setManagerConfig({
+      lastStatus:
+        "绑定体检完了: " + (task.platform || "") + " 在售 " + scan.entries.length + " 件",
+    });
+  } catch (e) {
+    await postResult(false, String((e && e.message) || e));
+    await setManagerConfig({
+      lastStatus: "绑定体检に失敗: " + String((e && e.message) || e),
+    });
+  } finally {
+    if (tabId != null) {
+      try {
+        await chrome.tabs.remove(tabId);
+      } catch (e) {}
+    }
+    stopKeepAlive();
+  }
 }
 
 function normalizeListingTitle(s) {

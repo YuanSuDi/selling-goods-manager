@@ -32,6 +32,7 @@ const { createDatastores } = require('./main/datastores')
 const { createRelistTasks } = require('./main/relist-tasks')
 const { createDelist } = require('./main/delist')
 const { registerInventoryIpc } = require('./main/ipc-inventory')
+const { registerHealthIpc, applyHealthScanResult } = require('./main/ipc-health')
 const { registerTaskIpc } = require('./main/ipc-tasks')
 const { syncExtensionBundle } = require('./main/extension-sync')
 
@@ -173,6 +174,8 @@ async function setConditionStock(product, conditionId, nextStock) {
 // 抽出モジュール（src/main/*）へ渡す共有コンテキスト。実体はこのファイルの
 // モジュール状態で、getter 経由で常に最新を返す（初期化順序に依存しない）。
 const ctx = {
+  get win() { return window },
+  get userDataDir() { return userDataDir },
   get db() { return db },
   get tasksDb() { return tasksDb },
   get inventory() { return inventory },
@@ -497,6 +500,16 @@ function startManagerServer() {
   // 再試行しない（次は手動で出品し直す）。
   // v0.2.0: レコード紐付きタスクはレコードへ、それ以外は従来処理へ。
   const handleTaskResult = async (task) => {
+    if (task && task.type === 'healthscan') {
+      persistTask(task)
+      sendTaskList()
+      try {
+        await applyHealthScanResult(ctx, task)
+      } catch (e) {
+        console.warn('[manager] health scan apply skipped:', e && e.message)
+      }
+      return
+    }
     if (inventory && task && task.type === 'delist' && task.listing_id) {
       const record = await inventory.getListing(task.listing_id)
       if (record) {
@@ -1307,6 +1320,9 @@ async function createWindow() {
   registerInventoryIpc(ctx)
 
   registerTaskIpc(ctx)
+
+  // ---- 绑定体检 IPC ----
+  registerHealthIpc(ctx)
   if (process.env.WEBPACK_DEV_SERVER_URL) {
     // Load the url of the dev server if in development mode
     await window.loadURL(process.env.WEBPACK_DEV_SERVER_URL)

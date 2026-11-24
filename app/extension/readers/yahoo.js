@@ -160,6 +160,9 @@
   function extractFromPageState() {
     let descHtml = null;
     let shipMethod = null;
+    let categoryPath = null;
+    let startPrice = null;
+    let winPrice = null;
     try {
       for (const s of document.querySelectorAll("script")) {
         const t = s.textContent || "";
@@ -169,10 +172,38 @@
             try { descHtml = JSON.parse('"' + m[1] + '"'); } catch (e) { descHtml = null; }
           }
         }
+        if (!categoryPath && t.includes('"category"') && t.includes('"path"')) {
+          const pm = t.match(/"category":\{"path":\[([\s\S]*?)\],"isAdult"/);
+          if (pm) {
+            const names = [];
+            for (const nm of pm[1].matchAll(/"name":"((?:[^"\\]|\\.)*)"/g)) {
+              try { names.push(JSON.parse('"' + nm[1] + '"')); } catch (e) { /* skip */ }
+            }
+            // 先頭の「オークション」(node 0) は出品ツリーの階層に無いので落とす。
+            // DOM のパンくず/詳細表は中間階層を落とすことがある（実測:
+            // フォグランプ > 社外品 > その他 が DOM では 社外品 欠落）。
+            // 状態 JSON の path が完全なので、取れたらこちらを正とする。
+            const segs = names.filter((n) => n && n !== "オークション");
+            if (segs.length >= 2) categoryPath = segs.join(" > ");
+          }
+        }
+        if (startPrice == null && t.includes('"initPrice"')) {
+          const m = t.match(/"initPrice":\s*"?(\d+)"?/);
+          if (m) startPrice = parseInt(m[1], 10);
+        }
+        if (winPrice == null && t.includes('"winPrice"')) {
+          const m = t.match(/"winPrice":\s*"?(\d+)"?/);
+          if (m) winPrice = parseInt(m[1], 10);
+        }
         if (!shipMethod && t.includes('"methods"')) {
           const m = t.match(/"shipping":\{"methods":\[\{"id":"[^"]*","name":"((?:[^"\\]|\\.)*)"/);
           if (m) {
             try { shipMethod = JSON.parse('"' + m[1] + '"'); } catch (e) { shipMethod = null; }
+            // 状態 JSON の名称は「おてがる配送ゆうパケット」のように
+            // 接頭辞付きで返る（2026-11-23 実測）。フォームのカード名は
+            // 接頭辞なし（ゆうパケット）なので、既知名称の最長一致で
+            // 正規化しておかないと自動選択が永遠に一致しない。
+            if (shipMethod) shipMethod = matchShipMethod(shipMethod) || shipMethod;
           }
         }
         if (descHtml && shipMethod) break;
@@ -180,7 +211,7 @@
     } catch (e) {
       /* 状態 JSON が無いページでは DOM 抽出に任せる */
     }
-    return { descHtml, shipMethod };
+    return { descHtml, shipMethod, categoryPath, startPrice, winPrice };
   }
 
   function htmlToReadableText(html) {
@@ -309,6 +340,20 @@
       if (cleanHtml) data.descriptionHtml = cleanHtml;
     }
     if (state.shipMethod) data.shippingMethod = state.shipMethod;
+    if (state.categoryPath) data.categoryText = state.categoryPath;
+    // 価格は状態 JSON を正とする: 開始価格は initPrice（入札があると
+    // DOM の現在価格とずれる）。開始価格より高い winPrice がある場合だけ
+    // 「即決ありのオークション」として buyNowPrice を立てる。定額出品は
+    // initPrice == winPrice なので従来どおり単一価格のまま（実測 2026-11-23:
+    // オークション initPrice 1180 / winPrice 1200、定額は両方 6800）。
+    if (state.startPrice != null) data.price = state.startPrice;
+    if (
+      state.winPrice != null &&
+      state.startPrice != null &&
+      state.winPrice > state.startPrice
+    ) {
+      data.buyNowPrice = state.winPrice;
+    }
     const saved = await FC.save(
       Object.assign({}, data, { source: "yahoo", sourceUrl: location.href })
     );

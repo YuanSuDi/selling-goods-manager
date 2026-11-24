@@ -76,6 +76,18 @@ function createManagerServer(options) {
   const taskImagePaths = new Set();
   let seq = 0;
 
+  // 绑定体检スキャン結果の整形。上限を設けて巨大な body を防ぐ。
+  function sanitizeScan(scan) {
+    if (!scan || !Array.isArray(scan.items)) return null;
+    const items = [];
+    for (const it of scan.items.slice(0, 3000)) {
+      const id = it && it.id != null ? String(it.id).slice(0, 64) : "";
+      if (!id) continue;
+      items.push({ id, title: it.title != null ? String(it.title).slice(0, 300) : "" });
+    }
+    return { complete: !!scan.complete, items };
+  }
+
   // タスクを 1 件作る（HTTP の POST と、Electron メインプロセス内からの
   // 直接作成の両方から使う）。タスクに載った画像パスは配信許可リストに入る。
   function addTask(body) {
@@ -87,6 +99,7 @@ function createManagerServer(options) {
       : body.type === "verify" ? "verify"
       : body.type === "delist" ? "delist"
       : body.type === "manual-delist" ? "manual-delist"
+      : body.type === "healthscan" ? "healthscan"
       : "listing";
     if ((type === "relist" || type === "verify" || type === "delist") && !body.itemUrl) {
       throw new Error("itemUrl is required for relist/verify/delist tasks");
@@ -119,7 +132,9 @@ function createManagerServer(options) {
         ? String(body.title)
         : type === "relist"
           ? String(body.itemUrl)
-          : "",
+          : type === "healthscan"
+            ? "绑定体检"
+            : "",
       description: body.description || "",
       price: body.price != null ? Number(body.price) : null,
       conditionText: body.conditionText || null,
@@ -373,6 +388,8 @@ function createManagerServer(options) {
           // 下架タスク専用: Mercari は削除ではなく一時停止になった印
           // （ID を保持するため、レコード側の反映が変わる）。
           paused: !!body.paused,
+          // 绑定体检タスク専用: 在售リストの列挙結果 { complete, items }。
+          scan: sanitizeScan(body.scan),
           at: new Date().toISOString(),
           executedBy: reqNodeId,
         };

@@ -13,6 +13,7 @@
     relistListing, claimListing, fixListingNode, setListingState,
     taskList,
   } from '../store';
+  import HealthCheckPanel from './HealthCheckPanel.vue';
   import { normalizeProductImageUrl } from '../utils/product-image'
 
   // ---- 自動補充フィルタ（検索結果に重ねる表示フィルタ） ----
@@ -338,6 +339,26 @@
     { value: 'paused', label: '状態：一時停止' },
     { value: 'unknown', label: '状態：要確認' },
   ];
+  // ---- 参照詳細のツリー表示 ----
+  // 状態ブランチは折りたためる。既定は全展開。
+  const collapsedConds = ref({});
+  const toggleCond = (id) => {
+    collapsedConds.value = { ...collapsedConds.value, [id]: !collapsedConds.value[id] };
+  };
+  // レコードの丸印: エラー=赤、一時停止=橙、販売済/未出品=灰、
+  // それ以外は従来タグ色と同じく自動補充 ON=緑 / OFF=青。
+  const recordDotColor = (r) => {
+    if (r.error) return '#ff4d4f';
+    if (r.listing_state === 'paused') return '#fa8c16';
+    if (r.listing_state === 'sold' || r.listing_state === 'unlisted') return '#b6bcc6';
+    return r.auto_restock ? '#52c41a' : '#2e6be6';
+  };
+  const refTotalStock = computed(() =>
+    conditions.value.reduce((sum, c) => sum + conditionStock(refDetailProduct.value, c._id), 0)
+  );
+  const refTotalSold = computed(() =>
+    conditions.value.reduce((sum, c) => sum + conditionSold(refDetailProduct.value, c._id), 0)
+  );
   // 手動下架の未処理エントリがある商品は行に印を出す。
   const hasManualDelist = (productNo) =>
     (taskList.value || []).some(
@@ -462,6 +483,8 @@
     <a-button @click="onClearAllFilters">条件クリア</a-button>
   </div>
 
+  <HealthCheckPanel />
+
   <a-table :dataSource="visibleData" :columns="columns" rowKey="product_no" :pagination="pagination" :scroll="{ x: 1440 }">
     <template #expandedRowRender="{ record }">
       <div class="expanded">
@@ -571,59 +594,73 @@
     <div v-if="prefixError" style="color: #ff4d4f; margin-top: 8px;">{{ prefixError }}</div>
     <p style="color: #999; margin-top: 12px;">※ タグの × で削除できます。削除した種類で絞り込み中だった場合は絞り込みが解除されます。追加・削除は自動で保存されます。</p>
   </a-modal>
-  <a-modal v-model:open="refDetailFlag" :title="'参照詳細（' + refDetailProductNo + '）'" :footer="null" width="760px">
+  <a-modal v-model:open="refDetailFlag" :title="'参照詳細（' + refDetailProductNo + '）'" :footer="null" width="820px">
     <template v-if="refDetailProduct">
       <p style="color: #999; margin-top: 0;">状態ごとに在庫と出品レコード（プラットフォーム × ブラウザ）を管理します。</p>
-      <div v-for="cond in conditions" :key="cond._id" class="ref-detail-block">
-        <div class="ref-detail-head">
-          <span class="ref-detail-name">
-            {{ cond.name }}
-            <a-tag v-if="cond.isDefault" color="default">既定</a-tag>
-          </span>
-          <span class="ref-detail-stock">在庫 {{ conditionStock(refDetailProduct, cond._id) }} / 販売 {{ conditionSold(refDetailProduct, cond._id) }}</span>
-          <a-button size="small" @click="openListingEdit(null, cond._id)">レコード追加</a-button>
+      <div class="ref-tree">
+        <div class="tree-root">
+          <span>{{ refDetailProduct.product_no }} {{ refDetailProduct.product_name }}</span>
+          <span class="ref-detail-stock">総在庫 {{ refTotalStock }} / 総販売 {{ refTotalSold }}</span>
         </div>
-        <div
-          v-for="r in recordsForCondition(refDetailProduct.product_no, cond._id)"
-          :key="r._id"
-          class="rec-row"
-        >
-          <div class="rec-main">
-            <a-tag :color="r.error ? 'red' : (r.auto_restock ? 'green' : 'blue')">{{ platformName(r.platform) }}</a-tag>
-            <a class="link" @click="urlClick(r.listing_url)">{{ r.listing_id }}</a>
-            <span class="rec-meta">ノード：{{ nodeLabel(r.node_id) }}</span>
-            <span class="rec-meta">自動補充：{{ r.auto_restock ? 'ON' : 'OFF' }}</span>
-            <span class="rec-meta">自動下架：{{ r.auto_delist ? 'ON' : 'OFF' }}</span>
-            <span class="rec-meta">状態：{{ listingStateLabel(r) || '出品中' }}{{ r.state_at ? '（' + String(r.state_at).slice(0, 16).replace('T', ' ') + ' 確認）' : '' }}</span>
-            <span class="rec-meta">配額：{{ r.quota != null ? r.quota : '無制限' }}（販売 {{ r.sold_count || 0 }}）</span>
-          </div>
-          <div v-if="r.error" class="rec-error">エラー：{{ r.error }}</div>
-          <div class="rec-ops">
-            <a-button size="small" @click="openListingEdit(r)">編集</a-button>
-            <a-button
-              size="small"
-              :disabled="conditionStock(refDetailProduct, cond._id) <= 0"
-              @click="relistListing(r._id)"
-            >補充出品</a-button>
-            <a-button v-if="!r.node_id || (r.listing_id && r.listing_state !== 'live')" size="small" @click="claimListing(r._id)">所有権を確認</a-button>
-            <a-select
-              size="small"
-              style="width: 170px"
-              :value="r.node_id || ''"
-              :options="nodeOptions"
-              @change="(v) => fixListingNode(r._id, v)"
-            />
-            <a-select
-              size="small"
-              style="width: 130px"
-              :value="r.listing_state || 'live'"
-              :options="LISTING_STATE_OPTIONS"
-              @change="(v) => setListingState(r._id, v)"
-            />
-            <a-button size="small" danger @click="askDeleteListing(r)">削除</a-button>
+        <div class="tree-children">
+          <div v-for="cond in conditions" :key="cond._id" class="tree-cond">
+            <div class="tree-cond-row">
+              <a-button size="small" type="text" class="tree-toggle" @click="toggleCond(cond._id)">{{ collapsedConds[cond._id] ? '▸' : '▾' }}</a-button>
+              <span class="ref-detail-name">
+                {{ cond.name }}
+                <a-tag v-if="cond.isDefault" color="default">既定</a-tag>
+              </span>
+              <span class="ref-detail-stock">在庫 {{ conditionStock(refDetailProduct, cond._id) }} / 販売 {{ conditionSold(refDetailProduct, cond._id) }}</span>
+              <a-button size="small" style="margin-left: auto;" @click="openListingEdit(null, cond._id)">レコード追加</a-button>
+            </div>
+            <div v-if="!collapsedConds[cond._id]" class="tree-children">
+              <div
+                v-for="r in recordsForCondition(refDetailProduct.product_no, cond._id)"
+                :key="r._id"
+                class="tree-rec"
+              >
+                <div class="rec-main">
+                  <span class="rec-dot" :style="{ background: recordDotColor(r) }"></span>
+                  <span class="rec-plat">{{ platformName(r.platform) }}</span>
+                  <span class="rec-meta">{{ nodeLabel(r.node_id) }}</span>
+                  <a class="link" @click="urlClick(r.listing_url)">{{ r.listing_id }}</a>
+                  <span class="rec-chip">状態 <b>{{ listingStateLabel(r) || '出品中' }}</b></span>
+                  <span class="rec-chip">配額 <b>{{ r.quota != null ? r.quota : '無制限' }}</b></span>
+                  <span class="rec-chip">販売 <b>{{ r.sold_count || 0 }}</b></span>
+                  <span class="rec-chip">補充 <b>{{ r.auto_restock ? 'ON' : 'OFF' }}</b></span>
+                  <span class="rec-chip">下架 <b>{{ r.auto_delist ? 'ON' : 'OFF' }}</b></span>
+                  <span v-if="r.state_at" class="rec-meta">{{ String(r.state_at).slice(0, 16).replace('T', ' ') }} 確認</span>
+                </div>
+                <div v-if="r.error" class="rec-error">エラー：{{ r.error }}</div>
+                <div class="rec-ops">
+                  <a-button size="small" @click="openListingEdit(r)">編集</a-button>
+                  <a-button
+                    size="small"
+                    :disabled="conditionStock(refDetailProduct, cond._id) <= 0"
+                    @click="relistListing(r._id)"
+                  >補充出品</a-button>
+                  <a-button v-if="!r.node_id || (r.listing_id && r.listing_state !== 'live')" size="small" @click="claimListing(r._id)">所有権を確認</a-button>
+                  <a-select
+                    size="small"
+                    style="width: 150px"
+                    :value="r.node_id || ''"
+                    :options="nodeOptions"
+                    @change="(v) => fixListingNode(r._id, v)"
+                  />
+                  <a-select
+                    size="small"
+                    style="width: 130px"
+                    :value="r.listing_state || 'live'"
+                    :options="LISTING_STATE_OPTIONS"
+                    @change="(v) => setListingState(r._id, v)"
+                  />
+                  <a-button size="small" danger @click="askDeleteListing(r)">削除</a-button>
+                </div>
+              </div>
+              <div v-if="!recordsForCondition(refDetailProduct.product_no, cond._id).length" class="tree-empty">レコードなし</div>
+            </div>
           </div>
         </div>
-        <div v-if="!recordsForCondition(refDetailProduct.product_no, cond._id).length" class="ref-none">レコードなし</div>
       </div>
     </template>
   </a-modal>
@@ -788,6 +825,74 @@
 .ref-detail-stock {
   color: #5f6672;
   font-size: 12px;
+}
+.tree-root {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 600;
+  padding: 2px 0 6px;
+}
+.tree-children {
+  margin-left: 9px;
+  border-left: 1px solid #e5e7eb;
+  padding-left: 16px;
+}
+.tree-cond {
+  position: relative;
+  padding: 6px 0 2px;
+}
+.tree-cond::before,
+.tree-rec::before,
+.tree-empty::before {
+  content: '';
+  position: absolute;
+  left: -16px;
+  top: 18px;
+  width: 14px;
+  border-top: 1px solid #e5e7eb;
+}
+.tree-cond-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.tree-toggle {
+  padding: 0 4px;
+  min-width: 22px;
+}
+.tree-rec {
+  position: relative;
+  padding: 8px 10px;
+  margin: 6px 0;
+  border: 1px solid #eceef1;
+  border-radius: 8px;
+}
+.tree-empty {
+  position: relative;
+  color: #b6bcc6;
+  padding: 4px 0;
+}
+.rec-plat {
+  font-weight: 600;
+}
+.rec-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+  display: inline-block;
+}
+.rec-chip {
+  font-size: 11px;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: #f4f6f8;
+  color: #5f6672;
+}
+.rec-chip b {
+  color: #1f2329;
+  font-weight: 600;
 }
 .rec-row {
   padding: 8px 10px;

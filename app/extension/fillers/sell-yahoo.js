@@ -186,15 +186,29 @@
       if (sq === sn) return true; // @ や空白の装飾差のみ
       return sq.length === sn.length * 2 && sq === sn + sn; // 文言の繰り返し行
     };
-    const findTreeEntry = (name) => {
+    // 列スコープ必須（2026-11-23 実測の事故）: 「その他」のような名前は
+    // 第1列を含む複数列に同時に出る。文書全体から最初に一致した行を押すと
+    // 第1列の「その他」を押してしまい、選択パスが巻き戻って失敗する
+    // （iPad用アクセサリー > その他、フォグランプ > 社外品 > その他 で再現）。
+    // 対象は常に「前段を押した列より右」の列にあるので、minX で絞る。
+    const findTreeEntry = (name, minX) => {
+      // minX は数値か、呼び出し時点の閾値を返す関数（ライブ境界）。
+      // 列コンテナは段を進めると自動で横スクロールして新しい列を見せる
+      // ため、数値で固定した境界はスクロール後に腐る（2026-11-23 実測:
+      // フォグランプ > 社外品 の次、その他 の列が境界の外に落ちて停滞）。
+      // 要素参照から毎回 getBoundingClientRect() を読み直せば追随できる。
+      const threshold = typeof minX === "function" ? minX() : minX;
+      const inScope = (el) => {
+        if (!FF.isVisible(el) || !entryTextMatches(el.textContent, name)) return false;
+        if (threshold == null) return true;
+        return el.getBoundingClientRect().left >= threshold;
+      };
       // 行は <a>。まずアンカーだけから探し、無ければ他の要素も見る。
-      const anchors = Array.from(document.querySelectorAll("a")).filter(
-        (el) => FF.isVisible(el) && entryTextMatches(el.textContent, name)
-      );
+      const anchors = Array.from(document.querySelectorAll("a")).filter(inScope);
       if (anchors.length) return anchors[0];
       const others = Array.from(
         document.querySelectorAll('button, li, [role="button"], [role="option"]')
-      ).filter((el) => FF.isVisible(el) && entryTextMatches(el.textContent, name));
+      ).filter(inScope);
       return others[0] || null;
     };
     // 要素の中心座標へ実マウス相当のイベント列を送る。座標なしの合成
@@ -234,12 +248,18 @@
       }, 8000, 250);
       if (!tab) return false;
       realClick(tab);
+      let prevEntry = null;
       for (let i = 0; i < segments.length; i++) {
-        const entry = await FF.waitFor(() => findTreeEntry(segments[i]), 9000, 300);
+        // 境界は前段の要素参照から毎回ライブに測る（自動横スクロール追随）。
+        const scopeFromPrev = () =>
+          prevEntry ? prevEntry.getBoundingClientRect().left + 10 : null;
+        const entry = await FF.waitFor(() => findTreeEntry(segments[i], scopeFromPrev), 9000, 300);
         if (!entry) return false;
         const isLeaf = i === segments.length - 1;
         const progressed = () =>
-          isLeaf ? !!findConfirmButton() : !!findTreeEntry(segments[i + 1]);
+          isLeaf
+            ? !!findConfirmButton()
+            : !!findTreeEntry(segments[i + 1], () => entry.getBoundingClientRect().left + 10);
         realClick(entry);
         let ok = await FF.waitFor(() => (progressed() ? true : null), 6000, 300);
         if (!ok) {
@@ -248,6 +268,7 @@
           ok = await FF.waitFor(() => (progressed() ? true : null), 6000, 300);
           if (!ok) return false;
         }
+        prevEntry = entry;
       }
       // 葉まで辿れたら確定ボタンが出るはず
       return clickConfirmButton();
@@ -529,23 +550,37 @@
     }
   }
 
-  // 配送方法を名称で選ぶ。実フォームの実測（2026-11-22 夜）:
-  //   - おてがる配送のカードは radio とテキストが同居するだけで <label> が
-  //     無い。カードの div へ合成イベントを送っても radio は切り替わらない
-  //     （Mercari で実証済みの法則: ラジオは要素自身の native click でしか
-  //     切り替わらない）。見つけた radio 自身を click するのが本命。
-  //   - ゆうパケット と ゆうパケットポスト は「1 つのカード = 1 つの
-  //     radio」の合体カード（ユーザー指摘の落とし穴）。カード名義は
-  //     先頭の ゆうパケット で、後半に ゆうパケットポスト も同居する。
-  //     逆に ゆうパケットポストmini は別カードなので、前方一致だけで
-  //     選ぶと mini を誤選択する。照合は 完全一致 → 合体カード → 前方
-  //     一致（曖昧なら不選択）の順に格付けする。
-  //   - 可視カードに無ければ「その他の配送方法」を 1 回だけ開いて探し直す。
+  // 配送方法を名称で選ぶ。
+  // 実フォームの実測（2026-11-22 夜）: おてがる配送のカードには <label> が
+  // 無く radio とテキストが同居するだけ。ゆうパケット と ゆうパケット
+  // ポスト は「1 カード = 1 radio」の合体カード（名義は先頭の
+  // ゆうパケット）。ゆうパケットポストmini は別カード（誤選択防止に
+  // 照合は 完全一致 → 合体カード → 前方一致 の順）。
+  // v0.12.33 で radio 自身の native click を本命にしたが実機で未選択
+  // だったため、v0.12.34（ローカル検証版）では複数手段を順に試し、
+  // 各手段の成否と radio の属性を診断文字列として返す。
   async function selectShipMethod(method) {
     const norm = (s) =>
       String(s || "").replace(/[\s　]/g, "").replace(/（EAZY）|\(EAZY\)/gi, "");
-    const target = norm(method);
-    if (!target) return false;
+    // 「おてがる配送ゆうパケット」のような接頭辞付きで渡ってきても
+    // カード名（接頭辞なし）に一致させる（読み取り側でも正規化するが二重化）。
+    const target = norm(method).replace(/^おてがる配送/, "");
+    const diag = { radios: -1, dummy: -1, tier: "-", strat: [], radio: "-" };
+    const done = (ok) => {
+      const d =
+        "radios=" + diag.radios + " dummy=" + diag.dummy +
+        " tier=" + diag.tier + " radio=" + diag.radio +
+        " strat=[" + diag.strat.join(" ") + "]";
+      console.log("[FurimaCopy] selectShipMethod diag:", d, "ok:", ok);
+      try {
+        chrome.storage.local.set({
+          fcLastShipDiag: { at: new Date().toISOString(), method, ok, diag: d },
+        });
+        if (!ok) chrome.runtime.sendMessage({ type: "FurimaShowShipDiag" });
+      } catch (e) { /* 診断の保存失敗は本処理に影響させない */ }
+      return { ok, diag: d };
+    };
+    if (!target) return done(false);
     const namePartOf = (el) =>
       norm(
         ((el.innerText || el.textContent || "").replace(/\s+/g, " ").trim()).split(
@@ -554,8 +589,6 @@
       );
     const fullTextOf = (el) =>
       norm((el.innerText || el.textContent || "").replace(/\s+/g, " "));
-    // 要素から上へ辿り、radio をちょうど 1 つ含む最小の祖先とその radio。
-    // 0 → 複数へ跳ぶ祖先しか無ければ null（カード単位で掴めない）。
     const singleRadioRow = (el) => {
       for (let n = el; n && n !== document.body; n = n.parentElement) {
         if (!n.querySelectorAll) continue;
@@ -567,6 +600,7 @@
     };
     const coordClick = (el) => {
       try {
+        el.scrollIntoView({ block: "center" });
         const r = el.getBoundingClientRect();
         const x = r.left + r.width / 2;
         const y = r.top + r.height / 2;
@@ -577,21 +611,8 @@
         }
       } catch (e) { /* 次の手段へ */ }
     };
-    const trySelect = (el) => {
-      const found = singleRadioRow(el);
-      if (!found) return false;
-      const { row, radio } = found;
-      try { radio.click(); } catch (e) { /* 次の手段へ */ }
-      if (radio.checked) return true;
-      FF.clickLikeUser(row);
-      if (radio.checked) return true;
-      coordClick(radio);
-      if (radio.checked) return true;
-      FF.clickLikeUser(el);
-      return radio.checked;
-    };
     const collectCandidates = () => {
-      const els = Array.from(document.querySelectorAll("label, div, span, td, li, a"))
+      const els = Array.from(document.querySelectorAll("label, div, span, td, li, a, p"))
         .filter((el) => {
           if (!FF.isVisible(el)) return false;
           const t = (el.innerText || "").replace(/\s+/g, " ").trim();
@@ -599,8 +620,7 @@
         })
         .sort((a, b) => (a.innerText || "").length - (b.innerText || "").length);
       const exact = els.filter((el) => namePartOf(el) === target);
-      if (exact.length) return exact;
-      // 合体カード: 名義は前方一致で、カード全文に対象名が同居している。
+      if (exact.length) { diag.tier = "exact/" + exact.length; return exact; }
       const combined = els.filter(
         (el) =>
           namePartOf(el) &&
@@ -608,32 +628,246 @@
           namePartOf(el).length < target.length &&
           fullTextOf(el).includes(target)
       );
-      if (combined.length) return combined;
+      if (combined.length) { diag.tier = "combined/" + combined.length; return combined; }
       const prefix = els.filter((el) => namePartOf(el).startsWith(target));
       const distinct = new Set(prefix.map((el) => namePartOf(el)));
-      if (distinct.size === 1) return prefix;
-      if (distinct.size > 1) {
-        console.log("[FurimaCopy] ship method ambiguous:", Array.from(distinct), "for", method);
-      }
+      if (distinct.size === 1) { diag.tier = "prefix/" + prefix.length; return prefix; }
+      diag.tier = "none";
       return [];
     };
-    let pool = collectCandidates();
+    // 本命ルート（実 DOM 2026-11-23、ユーザーが DevTools で提示）:
+    // おてがる配送のカードは <label class="OfficialDelivery__item
+    // js-ship-label"> で、中に name="shipmethod_dummy" の radio と
+    // .OfficialDelivery__itemTitle > p の方法名が入る。合体カードは
+    // 1 つの label の中に itemWrap が 2 つ（タイトル 2 つ）並ぶ。
+    // 人が押すのは label そのものなので、タイトルが対象名と一致する
+    // label を native click する（label の活性化で radio が切り替わり、
+    // Yahoo! 側の js-ship-label ハンドラにも届く）。
+    const labelRoute = async () => {
+      const rsAll = document.querySelectorAll('input[type="radio"]');
+      diag.radios = rsAll.length;
+      diag.dummy = Array.from(rsAll).filter((r) => r.name === "shipmethod_dummy").length;
+      const labels = Array.from(
+        document.querySelectorAll("label.js-ship-label, label.OfficialDelivery__item")
+      ).filter((el) => FF.isVisible(el));
+      for (const label of labels) {
+        const titles = Array.from(
+          label.querySelectorAll(".OfficialDelivery__itemTitle")
+        ).map((el) => norm(el.textContent || ""));
+        if (!titles.length) continue;
+        if (!titles.includes(target) && titles[0] !== target) continue;
+        const radio = label.querySelector('input[type="radio"]');
+        if (!radio) continue;
+        diag.tier = "label";
+        diag.radio =
+          "name=" + (radio.name || "-") + " id=" + (radio.id || "-") +
+          " value=" + (radio.value || "-") +
+          " dis=" + (radio.disabled ? 1 : 0) +
+          " vis=" + (FF.isVisible(radio) ? 1 : 0);
+        const tries = [
+          ["label", () => { try { label.click(); } catch (e) { /* noop */ } }],
+          ["native", () => { try { radio.click(); } catch (e) { /* noop */ } }],
+          ["labelcoord", () => coordClick(label)],
+          ["coord", () => coordClick(radio)],
+        ];
+        for (const [name, act] of tries) {
+          act();
+          const immediate = radio.checked;
+          let late = immediate;
+          if (immediate) {
+            await new Promise((r) => setTimeout(r, 600));
+            late = radio.checked;
+          }
+          diag.strat.push(name + ":" + (immediate ? (late ? "OK" : "reverted") : "0"));
+          if (immediate && late) return true;
+          if (immediate && !late) return false;
+        }
+        return false;
+      }
+      return null; // 対象 label が無い → 汎用ルートへ
+    };
+    // 本命ルート2（実 DOM 2026-11-23、ユーザー提示）: 「その他の配送方法」
+    // の radio は data-deliveryname に方法名そのものを持つ
+    // （例 data-delivery-id="404" data-deliveryname="レターパックプラス"）。
+    // 展開見出しは dt.js-expand-trigger、開状態は dl.js-expand-body の
+    // is-open クラス。手順は「先に展開 → それから label を click」。
+    const setRadioDiag = (radio) => {
+      diag.radio =
+        "name=" + (radio.name || "-") + " id=" + (radio.id || "-") +
+        " value=" + (radio.value || "-") +
+        " dis=" + (radio.disabled ? 1 : 0) +
+        " vis=" + (FF.isVisible(radio) ? 1 : 0);
+    };
+    const findByDeliveryName = () =>
+      Array.from(
+        document.querySelectorAll('input[type="radio"][name="shipmethod_dummy"]')
+      ).find((r) => norm(r.getAttribute("data-deliveryname") || "") === target) || null;
+    const clickRadioHuman = async (radio) => {
+      const label = radio.closest("label");
+      const tries = [];
+      if (label) tries.push(["label", () => { try { label.click(); } catch (e) { /* noop */ } }]);
+      tries.push(["native", () => { try { radio.click(); } catch (e) { /* noop */ } }]);
+      if (label) tries.push(["labelcoord", () => coordClick(label)]);
+      tries.push(["coord", () => coordClick(radio)]);
+      for (const [name, act] of tries) {
+        act();
+        const immediate = radio.checked;
+        let late = immediate;
+        if (immediate) {
+          await new Promise((r) => setTimeout(r, 600));
+          late = radio.checked;
+        }
+        diag.strat.push(name + ":" + (immediate ? (late ? "OK" : "reverted") : "0"));
+        if (immediate && late) return true;
+        if (immediate && !late) return false;
+      }
+      return false;
+    };
+    const ensureOtherExpanded = async () => {
+      const isOpen = () => {
+        const body = document.querySelector("dl.js-expand-body");
+        if (body && body.classList.contains("is-open")) return true;
+        return Array.from(
+          document.querySelectorAll('input[name="shipmethod_dummy"][data-deliverytype="is_other_ship"]')
+        ).some((r) => FF.isVisible(r));
+      };
+      if (isOpen()) return true;
+      const trigger =
+        document.querySelector("dt.js-expand-trigger") ||
+        Array.from(
+          document.querySelectorAll("a, button, div, span, dt, dd, summary, li, p, label")
+        )
+          .filter((el) => FF.isVisible(el))
+          .find((el) => norm(el.innerText || el.textContent || "") === "その他の配送方法");
+      if (!trigger) { diag.strat.push("expand:notfound"); return false; }
+      coordClick(trigger);
+      let ok = await FF.waitFor(() => isOpen() || null, 1500, 200);
+      if (!ok) {
+        try { trigger.click(); } catch (e) { /* noop */ }
+        ok = await FF.waitFor(() => isOpen() || null, 3000, 200);
+      }
+      diag.strat.push("expand:" + (ok ? "ok" : "empty"));
+      return !!ok;
+    };
+    let dRadio = findByDeliveryName();
+    if (dRadio && !FF.isVisible(dRadio)) {
+      await ensureOtherExpanded();
+      dRadio = findByDeliveryName();
+    }
+    if (dRadio) {
+      diag.tier = "dname";
+      setRadioDiag(dRadio);
+      if (await clickRadioHuman(dRadio)) return done(true);
+    }
+    const labelResult = await labelRoute();
+    if (labelResult !== null) return done(labelResult);
+    if (!dRadio) {
+      await ensureOtherExpanded();
+      const r2 = findByDeliveryName();
+      if (r2) {
+        diag.tier = "dname-after-expand";
+        setRadioDiag(r2);
+        if (await clickRadioHuman(r2)) return done(true);
+      }
+    }
+
+    // 候補が描画されるまで最大 8 秒待つ（セクションの遅延描画対策）。
+    let pool = await FF.waitFor(() => collectCandidates().length || null, 8000, 400)
+      .then(() => collectCandidates())
+      .catch(() => collectCandidates());
     if (!pool.length) {
-      // 「その他の配送方法」が閉じていたら 1 回だけ開いて探し直す。
-      const expander = Array.from(document.querySelectorAll("a, button, div, span"))
+      // 「その他の配送方法」の展開見出しは <dt>（実 DOM 2026-11-23、
+      // ブラウザの読み取りで確認）。a/button/div/span だけを探す旧実装は
+      // 見出し自体が見つからず、レターパックプラス等の非おてがる方法が
+      // 一切選べなかった（diag: tier=none strat=[] の正体）。
+      // 座標クリック → native click の順に試し、候補の出現で検証する。
+      const expander = Array.from(
+        document.querySelectorAll("a, button, div, span, dt, dd, summary, li, p, label")
+      )
         .filter((el) => FF.isVisible(el))
         .find((el) => norm(el.innerText || el.textContent || "") === "その他の配送方法");
       if (expander) {
-        FF.clickLikeUser(expander);
-        // 展開アニメーション/描画を待ってから探し直す
-        await FF.waitFor(() => collectCandidates().length || null, 3000, 250);
+        coordClick(expander);
+        const appeared = await FF.waitFor(
+          () => collectCandidates().length || null, 1500, 250
+        );
+        if (!appeared) {
+          try { expander.click(); } catch (e) { /* noop */ }
+          await FF.waitFor(() => collectCandidates().length || null, 3000, 250);
+        }
         pool = collectCandidates();
+        diag.strat.push("expand:" + (pool.length ? "ok" : "empty"));
+      } else {
+        diag.strat.push("expand:notfound");
       }
     }
-    for (const el of pool) {
-      if (trySelect(el)) return true;
+    const allRadios = Array.from(document.querySelectorAll('input[type="radio"]'));
+    diag.radios = allRadios.length;
+    diag.dummy = allRadios.filter((r) => r.name === "shipmethod_dummy").length;
+    // 祖先辿りで掴めない場合の幾何フォールバック: radio がカードとは
+    // 別コンテナに絶対配置されている UI では、祖先に radio が 0→全数と
+    // 跳んで行方不明になる。その場合は「対象名を持つ要素の矩形に
+    // 中心が入る radio」を幾何で対応付ける。
+    const geometricRow = (el) => {
+      let card = el;
+      for (let n = el; n && n !== document.body; n = n.parentElement) {
+        const t = norm(n.innerText || n.textContent || "");
+        if (t.length > 140) break;
+        card = n;
+      }
+      const cr = card.getBoundingClientRect();
+      if (!cr.width || !cr.height) return null;
+      const hits = allRadios.filter((r) => {
+        const rr = r.getBoundingClientRect();
+        const cx = rr.left + rr.width / 2;
+        const cy = rr.top + rr.height / 2;
+        return cx >= cr.left - 4 && cx <= cr.right + 4 && cy >= cr.top - 4 && cy <= cr.bottom + 4;
+      });
+      return hits.length === 1 ? { row: card, radio: hits[0] } : null;
+    };
+    for (const el of pool.slice(0, 3)) {
+      let found = singleRadioRow(el);
+      if (!found) {
+        found = geometricRow(el);
+        if (!found) { diag.strat.push("row:null"); continue; }
+        diag.strat.push("geo");
+      }
+      const { row, radio } = found;
+      diag.radio =
+        "name=" + (radio.name || "-") + " id=" + (radio.id || "-") +
+        " value=" + (radio.value || "-") +
+        " dis=" + (radio.disabled ? 1 : 0) +
+        " vis=" + (FF.isVisible(radio) ? 1 : 0);
+      const strategies = [
+        ["native", () => { try { radio.click(); } catch (e) { /* noop */ } }],
+        ["card", () => coordClick(row)],
+        ["coord", () => coordClick(radio)],
+        ["setter", () => {
+          try {
+            const setter = Object.getOwnPropertyDescriptor(
+              window.HTMLInputElement.prototype, "checked"
+            ).set;
+            setter.call(radio, true);
+            radio.dispatchEvent(new Event("input", { bubbles: true }));
+            radio.dispatchEvent(new Event("change", { bubbles: true }));
+          } catch (e) { /* noop */ }
+        }],
+        ["rowlike", () => FF.clickLikeUser(row)],
+      ];
+      for (const [name, act] of strategies) {
+        act();
+        const immediate = radio.checked;
+        let late = immediate;
+        if (immediate) {
+          await new Promise((r) => setTimeout(r, 600));
+          late = radio.checked;
+        }
+        diag.strat.push(name + ":" + (immediate ? (late ? "OK" : "reverted") : "0"));
+        if (immediate && late) return done(true);
+        if (immediate && !late) break; // 付いても戻されるなら次の候補でも同じ
+      }
     }
-    return false;
+    return done(false);
   }
 
   // 編集欄に実際に入った説明テキストを読み戻す（入力検証用）。
@@ -731,22 +965,154 @@
     }
     lines.push({ label: "商品の説明", status: descStatus, note: descNote });
 
-    // 開始価格（コピー元の価格をそのまま入れる。希望落札価格は手動）
-    const priceOk = FF.fillText(
-      ['input[name*="startprice" i]', 'input[name*="price" i]', 'input[name*="start" i]', 'input[id*="price" i]'],
-      ["開始価格"],
-      data.price != null ? String(data.price) : null
-    );
-    lines.push({
-      label: "開始価格",
-      status: priceOk ? "ok" : "fail",
-      note: priceOk ? "¥" + Number(data.price).toLocaleString("ja-JP") : data.price != null ? "入力欄が見つかりませんでした" : "コピー元に価格がありません",
-    });
-    lines.push({
-      label: "希望落札価格",
-      status: "manual",
-      note: "手動で入力してください（開始価格と同じにするか空欄）",
-    });
+    // ---- 価格 -------------------------------------------------------------
+    // 実 DOM（2026-11-23、ユーザー提示）: 価格エリア #js-FCNonPrePriceArea
+    // の中に販売形式ラジオ name="salesmode"（#salesmode_auction = オークション、
+    // もう一方がフリマ（定額））があり、形式で #price_auction / #price_buynow
+    // が切り替わる。オークション側には開始価格の入力欄と「即決価格を設定する」
+    // トグルの下に即決価格の入力欄（注記「この価格で商品の購入が確定し、
+    // オークションが終了します」付き）。
+    // 教訓: 入力欄の name 推測は外れた（開始価格のつもりが即決側に入った）。
+    // 価格はラベル/注記の行から入力欄を探して直接入れる。
+    const setValueDirect = (inp, v) => {
+      try {
+        const setter = Object.getOwnPropertyDescriptor(
+          HTMLInputElement.prototype, "value"
+        ).set;
+        setter.call(inp, String(v));
+        inp.dispatchEvent(new Event("input", { bubbles: true }));
+        inp.dispatchEvent(new Event("change", { bubbles: true }));
+        return String(inp.value || "").replace(/[^0-9]/g, "") === String(v);
+      } catch (e) {
+        return false;
+      }
+    };
+    const findInputByRowText = (needle, maxLen) => {
+      const labs = Array.from(
+        document.querySelectorAll("label, th, dt, div, span, p, td")
+      ).filter(
+        (el) =>
+          FF.isVisible(el) &&
+          (el.textContent || "").includes(needle) &&
+          (el.textContent || "").length < (maxLen || 40)
+      );
+      for (const lab of labs) {
+        let row = lab;
+        for (let up = 0; up < 6 && row; up++) {
+          const inp =
+            row.querySelector &&
+            row.querySelector('input[type="text"], input[type="number"], input:not([type])');
+          if (inp) return inp;
+          row = row.parentElement;
+        }
+      }
+      return null;
+    };
+    const clickEl = (el) => {
+      try {
+        el.scrollIntoView({ block: "center" });
+        const r = el.getBoundingClientRect();
+        const x = r.left + r.width / 2;
+        const y = r.top + r.height / 2;
+        const t = document.elementFromPoint(x, y) || el;
+        const opts = {
+          bubbles: true, cancelable: true, view: window,
+          clientX: x, clientY: y, button: 0,
+        };
+        for (const ty of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+          t.dispatchEvent(new MouseEvent(ty, opts));
+        }
+        return true;
+      } catch (e) {
+        try { el.click(); return true; } catch (e2) { return false; }
+      }
+    };
+
+    if (data.buyNowPrice != null && data.price != null) {
+      // 2 価格のオークション: まず販売形式で「オークション」を選ぶ
+      // （選ばないと入力欄が揃わない — ユーザー指摘 2026-11-23）。
+      const auctionRadio =
+        document.getElementById("salesmode_auction") ||
+        document.querySelector('input[name="salesmode"][value="auction"]');
+      if (auctionRadio && !auctionRadio.checked) {
+        const lab = auctionRadio.closest("label");
+        if (lab) { try { lab.click(); } catch (e) { /* noop */ } }
+        if (!auctionRadio.checked) {
+          try { auctionRadio.click(); } catch (e) { /* noop */ }
+        }
+        await new Promise((r) => setTimeout(r, 600));
+      }
+      // 開始価格（行ラベルから探して直接入力、ダメなら従来の汎用入力）
+      const startInp = findInputByRowText("開始価格", 30);
+      let startOk = startInp ? setValueDirect(startInp, data.price) : false;
+      if (!startOk) {
+        startOk = FF.fillText(
+          ['input[name*="startprice" i]', 'input[name*="price" i]', 'input[name*="start" i]', 'input[id*="price" i]'],
+          ["開始価格"],
+          String(data.price)
+        );
+      }
+      lines.push({
+        label: "開始価格",
+        status: startOk ? "ok" : "fail",
+        note: startOk
+          ? "¥" + Number(data.price).toLocaleString("ja-JP")
+          : "入力欄が見つかりませんでした",
+      });
+      // 即決価格: 注記の行から探す。見えなければトグルを開いてから探し直す。
+      let winInp = findInputByRowText("この価格で商品の購入が確定", 60);
+      if (winInp && startInp && winInp === startInp) winInp = null;
+      if (!winInp || !FF.isVisible(winInp)) {
+        const toggle = Array.from(
+          document.querySelectorAll("a, button, div, span, p")
+        ).find(
+          (el) =>
+            FF.isVisible(el) &&
+            (el.textContent || "").includes("即決価格を設定する") &&
+            (el.textContent || "").length < 30
+        );
+        if (toggle) {
+          clickEl(toggle);
+          await new Promise((r) => setTimeout(r, 700));
+          winInp = findInputByRowText("この価格で商品の購入が確定", 60);
+          if (winInp && startInp && winInp === startInp) winInp = null;
+        }
+      }
+      if (!winInp) {
+        const area = document.getElementById("price_auction");
+        if (area) {
+          winInp =
+            Array.from(
+              area.querySelectorAll('input[type="text"], input[type="number"], input:not([type])')
+            ).filter((inp) => inp !== startInp && FF.isVisible(inp))[0] || null;
+        }
+      }
+      const winOk = winInp ? setValueDirect(winInp, data.buyNowPrice) : false;
+      lines.push({
+        label: "即決価格",
+        status: winOk ? "ok" : "fail",
+        note: winOk
+          ? "¥" + Number(data.buyNowPrice).toLocaleString("ja-JP")
+          : "入力欄が見つからないか、値が反映されませんでした",
+      });
+    } else {
+      // 単一価格（定額など）: 従来どおり開始価格欄へ入れる。
+      const priceOk = FF.fillText(
+        ['input[name*="startprice" i]', 'input[name*="price" i]', 'input[name*="start" i]', 'input[id*="price" i]'],
+        ["開始価格"],
+        data.price != null ? String(data.price) : null
+      );
+      lines.push({
+        label: "開始価格",
+        status: priceOk ? "ok" : "fail",
+        note: priceOk ? "¥" + Number(data.price).toLocaleString("ja-JP") : data.price != null ? "入力欄が見つかりませんでした" : "コピー元に価格がありません",
+      });
+      lines.push({
+        label: "即決価格",
+        status: "manual",
+        note: "手動で入力してください（必要な場合）",
+      });
+    }
 
     // 画像（単体ファイル入力が複数ある前提で配布される）
     if (data.imageUrls && data.imageUrls.length) {
@@ -797,11 +1163,13 @@
     ) {
       if (data.shippingMethod) {
         shipHandled = true;
-        const ok = await selectShipMethod(data.shippingMethod);
+        const shipRes = await selectShipMethod(data.shippingMethod);
         lines.push({
           label: "配送方法",
-          status: ok ? "ok" : "fail",
-          note: ok ? data.shippingMethod : "自動選択できませんでした（候補： " + data.shippingMethod + "）",
+          status: shipRes.ok ? "ok" : "fail",
+          note: shipRes.ok
+            ? data.shippingMethod
+            : "自動選択できませんでした（候補： " + data.shippingMethod + "） " + shipRes.diag,
         });
       }
       if (data.shippingBurden) {
@@ -938,6 +1306,24 @@
         if (catInput && catInput.value && catInput.value !== "0" && shown.includes(leaf)) {
           try { await chrome.storage.local.remove(CATEGORY_PENDING_KEY); } catch (e) { /* noop */ }
           FC.ui.showToast("カテゴリを自動選択しました：" + (pending.path || shown));
+          // 結果パネルはカテゴリ選択ページへの遷移で DOM ごと消えてしまう
+          // （表示されるのは遷移前の 1 秒弱だけ）。戻ってきたら、保存済みの
+          // レポートのカテゴリ行を OK に差し替えてパネルを再表示する。
+          try {
+            const repRes = await chrome.storage.local.get("lastFillReport");
+            const rep = repRes.lastFillReport;
+            if (rep && Array.isArray(rep.lines)) {
+              const lines = rep.lines.map((l) =>
+                l.label === "カテゴリ"
+                  ? { label: l.label, status: "ok", note: pending.path || shown }
+                  : l
+              );
+              FF.showPanel(
+                rep.title || "Yahoo!オークション 出品フォーム入力結果",
+                lines
+              );
+            }
+          } catch (e) { /* noop */ }
           return;
         }
         await new Promise((r) => setTimeout(r, 1500));

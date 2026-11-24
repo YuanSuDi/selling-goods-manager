@@ -525,3 +525,24 @@ ipc.on('manual_sale_multi_record', (e, info) => {
   alertMsg.value = `${info.product_no}：その状態に自動補充レコードが複数あります。参照詳細から対象レコードの「補充出品」を押してください。`
   alertDisFlg.value = true
 })
+
+// ---- 绑定体检（レコード対照） ----
+// メインプロセスが health-report.json を正本に持ち、health_report で
+// フラットな { updatedAt, scopes, issues } を配信する。
+export const healthReport = ref(null)
+export const healthIssues = computed(
+  () => (healthReport.value && healthReport.value.issues) || []
+)
+export const healthIssueCount = computed(() => healthIssues.value.length)
+ipc.on('health_report', (e, report) => {
+  healthReport.value = report || null
+})
+ipc.send('health_get')
+export const startHealthScan = () => ipc.send('health_scan_start')
+export const dismissHealthIssue = (key) => ipc.send('health_dismiss', key)
+ipc.on('health_result', (e, result) =>
+  handleMetaResult(
+    result,
+    '绑定体检を開始しました。各ブラウザが順に在售リストをスキャンします（1分ほどかかります）。'
+  )
+)
