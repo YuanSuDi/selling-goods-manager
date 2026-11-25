@@ -1,7 +1,7 @@
 <script setup>
   import {
     product_no, amazon_url, comment, product_img_dir,
-    isLoading, lodingTip, speedSubmit,
+    isLoading, lodingTip, speedSubmit, selectImageDir,
   } from '../store';
 </script>
 
@@ -17,7 +17,10 @@
       <a-input v-model:value="comment" placeholder="備考" />
     </a-form-item>
     <a-form-item label="写真パス">
-      <a-input v-model:value="product_img_dir" placeholder="写真パス" />
+      <div style="display: flex; gap: 8px">
+        <a-input v-model:value="product_img_dir" placeholder="写真パス" style="flex: 1" />
+        <a-button @click="selectImageDir">フォルダを選択</a-button>
+      </div>
     </a-form-item>
     <a-form-item class="form-actions">
       <a-spin :tip="lodingTip" :spinning="isLoading">

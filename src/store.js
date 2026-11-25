@@ -441,6 +441,15 @@ ipc.on('main_image_selected', (e, filePath) => {
   if (filePath) editInfoByMainImg.value = filePath
 })
 
+export const selectImageDir = () => ipc.send('select_image_dir')
+ipc.on('image_dir_selected', (e, dirPath) => {
+  if (dirPath) product_img_dir.value = dirPath
+})
+export const selectProductImg = () => ipc.send('select_product_img')
+ipc.on('product_img_selected', (e, filePath) => {
+  if (filePath) product_img.value = filePath
+})
+
 // ---- v0.2.0: 状態（コンディション）・出品レコード・ノード ----
 // メインプロセスが正本を持ち、inventory_meta で丸ごと配信する。
 export const conditions = ref([])

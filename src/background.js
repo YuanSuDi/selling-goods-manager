@@ -1189,6 +1189,29 @@ async function createWindow() {
     }
   })
 
+  // 写真パス（フォルダ）の選択ダイアログ（追加/クイック追加/画像DLフォーム用）
+  ipcMain.on('select_image_dir', async (e) => {
+    const result = await dialog.showOpenDialog(window, {
+      title: '写真フォルダを選択',
+      properties: ['openDirectory', 'createDirectory'],
+    })
+    if (!result.canceled && result.filePaths && result.filePaths[0]) {
+      e.sender.send('image_dir_selected', result.filePaths[0])
+    }
+  })
+
+  // メイン写真（ファイル）の選択ダイアログ（商品追加フォーム用）
+  ipcMain.on('select_product_img', async (e) => {
+    const result = await dialog.showOpenDialog(window, {
+      title: 'メイン写真を選択',
+      properties: ['openFile'],
+      filters: [{ name: '画像', extensions: ['jpg', 'jpeg', 'png', 'webp', 'gif'] }],
+    })
+    if (!result.canceled && result.filePaths && result.filePaths[0]) {
+      e.sender.send('product_img_selected', result.filePaths[0])
+    }
+  })
+
   //商品入库（v0.2.0: 状態別の在庫を絶対値で設定し、合計を sku に同期）
   ipcMain.on('addProductCount', async (e, data) => {
     try {
