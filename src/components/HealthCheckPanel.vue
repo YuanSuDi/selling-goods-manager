@@ -1,9 +1,16 @@
 <script setup>
-  import { computed } from 'vue'
+  import { computed, ref } from 'vue'
   import {
     healthReport, healthIssues, startHealthScan, dismissHealthIssue,
     saveListing, setListingState, nodeLabel, platformName, urlClick,
   } from '../store'
+
+  // 折りたたみ状態は端末に覚えさせる（異常が大量に出ると一覧を圧迫するため）
+  const collapsed = ref(localStorage.getItem('fcHealthCollapsed') === '1')
+  const toggleCollapsed = () => {
+    collapsed.value = !collapsed.value
+    localStorage.setItem('fcHealthCollapsed', collapsed.value ? '1' : '0')
+  }
 
   const scopes = computed(() => (healthReport.value && healthReport.value.scopes) || [])
   const updatedAt = computed(() => (healthReport.value && healthReport.value.updatedAt) || null)
@@ -57,7 +64,10 @@
       <span v-for="sc in scopes" :key="sc.key" class="health-meta">
         {{ platformName(sc.platform) }} / {{ nodeLabel(sc.nodeId) }}：在售 {{ sc.liveCount }} 件<template v-if="!sc.complete">（扫描不完全，「不在售」判定已跳过）</template>
       </span>
+      <span v-if="healthIssues.length" class="health-meta">异常 {{ healthIssues.length }} 件</span>
+      <a-button size="small" style="margin-left: auto" @click="toggleCollapsed">{{ collapsed ? '展开' : '收起' }}</a-button>
     </div>
+    <template v-if="!collapsed">
     <div v-if="!healthReport" class="health-empty">
       还没有扫描过。点「开始体检」，各浏览器会依次拉取自己账号的在售列表，与记录逐条对照。
     </div>
@@ -76,6 +86,7 @@
         <a-button size="small" type="text" @click="dismissHealthIssue(issue.key)">忽略</a-button>
       </span>
     </div>
+    </template>
   </div>
 </template>
 
