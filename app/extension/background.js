@@ -2530,13 +2530,16 @@ async function scanMercariLiveListings(tabId) {
   const byId = new Map();
   let stableRounds = 0;
   let complete = false;
+  let pageTotal = null;
+  let diag = null;
   for (let round = 0; round < 40; round++) {
     const results = await chrome.scripting
       .executeScript({
         target: { tabId },
         func: () => {
           const out = [];
-          for (const a of document.querySelectorAll("a[href]")) {
+          const anchors = document.querySelectorAll("a[href]");
+          for (const a of anchors) {
             let u;
             try {
               u = new URL(a.href, location.href);
@@ -2553,24 +2556,46 @@ async function scanMercariLiveListings(tabId) {
               .trim();
             out.push({ id: m[1], title });
           }
+          // ページ上部に出る「○○件」がこの一覧の総数（実ページで確認済み）。
+          // 完全性の判定はスクロール回数ではなく、この総数との突合を主に使う。
+          let total = null;
+          const tm = ((document.body && document.body.innerText) || "").match(
+            /(\d+)\s*件/
+          );
+          if (tm) total = parseInt(tm[1], 10);
           window.scrollTo(0, document.body.scrollHeight);
-          return out;
+          return {
+            items: out,
+            total,
+            href: location.href,
+            title: document.title,
+            anchors: anchors.length,
+          };
         },
       })
       .catch(() => null);
-    const entries = results && results[0] && results[0].result;
-    if (!entries) return null;
+    const data = results && results[0] && results[0].result;
+    if (!data) return null;
+    diag = { href: data.href, title: data.title, anchors: data.anchors };
+    if (typeof data.total === "number" && data.total > 0) {
+      pageTotal = data.total;
+    }
     const before = byId.size;
-    for (const e of entries) {
+    for (const e of data.items || []) {
       const prev = byId.get(e.id);
       if (!prev || (e.title && e.title.length > (prev.title || "").length)) {
         byId.set(e.id, e);
       }
     }
+    if (pageTotal != null && byId.size >= pageTotal) {
+      complete = true;
+      break;
+    }
     if (byId.size === before) {
       stableRounds += 1;
       if (stableRounds >= 2) {
-        complete = byId.size > 0;
+        // 総数が読めたのに届いていない場合は不完全のままにする
+        complete = byId.size > 0 && pageTotal == null;
         break;
       }
     } else {
@@ -2578,7 +2603,7 @@ async function scanMercariLiveListings(tabId) {
     }
     await remoteSleep(1100);
   }
-  return { entries: Array.from(byId.values()), complete };
+  return { entries: Array.from(byId.values()), complete, pageTotal, diag };
 }
 
 // 绑定体检タスク: このブラウザ（ノード）の在售リストを列挙して
@@ -2625,9 +2650,11 @@ async function executeHealthScanTask(cfg, task) {
       await waitForTabComplete(tabId, 45000);
       scan = await scanSellingListEntriesEx(tabId);
     } else {
+      // バックグラウンドタブでは一覧が描画されず 0 件になった実績がある
+      // （2026-11-25）ため、Mercari のスキャンだけ前面タブで開く。
       const tab = await chrome.tabs.create({
         url: "https://jp.mercari.com/mypage/listings",
-        active: false,
+        active: true,
       });
       tabId = tab.id;
       try {
@@ -2642,7 +2669,18 @@ async function executeHealthScanTask(cfg, task) {
     if (!scan) throw new Error("出品中一覧を取得できませんでした");
     await postResult(
       true,
-      "在售 " + scan.entries.length + " 件" + (scan.complete ? "" : "（不完全なスキャン）"),
+      "在售 " +
+        scan.entries.length +
+        " 件" +
+        (scan.complete ? "" : "（不完全なスキャン）") +
+        (scan.entries.length === 0 && scan.diag
+          ? " diag: " +
+            scan.diag.title +
+            " / anchors=" +
+            scan.diag.anchors +
+            " / " +
+            scan.diag.href
+          : ""),
       { complete: scan.complete, items: scan.entries }
     );
     await setManagerConfig({
