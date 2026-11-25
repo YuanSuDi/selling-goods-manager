@@ -33,6 +33,7 @@ const { createRelistTasks } = require('./main/relist-tasks')
 const { createDelist } = require('./main/delist')
 const { registerInventoryIpc } = require('./main/ipc-inventory')
 const { registerHealthIpc, applyHealthScanResult } = require('./main/ipc-health')
+const { registerTdocIpc } = require('./main/tdoc-sync')
 const { registerTaskIpc } = require('./main/ipc-tasks')
 const { syncExtensionBundle } = require('./main/extension-sync')
 
@@ -178,6 +179,8 @@ const ctx = {
   get userDataDir() { return userDataDir },
   get db() { return db },
   get tasksDb() { return tasksDb },
+  get conditionsDb() { return conditionsDb },
+  setConditionStock,
   get inventory() { return inventory },
   get managerServer() { return managerServer },
   get defaultConditionId() { return defaultConditionId },
@@ -1410,6 +1413,8 @@ async function createWindow() {
 
   // ---- 绑定体检 IPC ----
   registerHealthIpc(ctx)
+  // ---- 腾讯文档同步 IPC ----
+  registerTdocIpc(ctx)
   if (process.env.WEBPACK_DEV_SERVER_URL) {
     // Load the url of the dev server if in development mode
     await window.loadURL(process.env.WEBPACK_DEV_SERVER_URL)

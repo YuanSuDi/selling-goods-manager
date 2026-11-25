@@ -1,7 +1,7 @@
 <script setup>
   // 画面シェル（旧単一ファイルから分割）。状態と IPC は ../store.js に集約し、
   // 一覧・追加フォーム・各モーダルは個別コンポーネントに分かれている。
-  import { PlusOutlined, UnorderedListOutlined, ShopOutlined, LinkOutlined, FolderOpenOutlined } from '@ant-design/icons-vue';
+  import { PlusOutlined, UnorderedListOutlined, ShopOutlined, LinkOutlined, FolderOpenOutlined, CloudSyncOutlined } from '@ant-design/icons-vue';
   import {
     activeKey, alertDisFlg, alertMsg, alertDisFlgHandleClose,
     successFlg, successMsg, activeTaskCount, openTaskModal, showManagerInfo,
@@ -10,6 +10,7 @@
   import ProductAddForm from './ProductAddForm.vue';
   import ProductQuickAdd from './ProductQuickAdd.vue';
   import ProductImageDownload from './ProductImageDownload.vue';
+  import TdocSyncPanel from './TdocSyncPanel.vue';
   import EditProductModal from './EditProductModal.vue';
   import MercariBindingModal from './MercariBindingModal.vue';
   import YahooBindingModal from './YahooBindingModal.vue';
@@ -107,6 +108,16 @@
               </span>
             </template>
             <ProductImageDownload />
+          </a-tab-pane>
+
+          <a-tab-pane key="5">
+            <template #tab>
+              <span>
+                <CloudSyncOutlined />
+                腾讯文档同步
+              </span>
+            </template>
+            <TdocSyncPanel />
           </a-tab-pane>
         </a-tabs>
       </div>

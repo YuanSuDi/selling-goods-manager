@@ -557,3 +557,25 @@ ipc.on('health_result', (e, result) =>
     '绑定体检を開始しました。各ブラウザが順に在售リストをスキャンします（1分ほどかかります）。'
   )
 )
+
+// ---- 腾讯文档同步 ----
+// メインプロセスが tdoc-sync.json（設定・スナップショット・前回結果）を
+// 正本に持ち、tdoc_state で配信する。Token 本体はレンダラーへ送らない。
+export const tdocState = ref(null)
+export const tdocSheets = ref(null)
+ipc.on('tdoc_state', (e, state) => {
+  tdocState.value = state || null
+})
+ipc.on('tdoc_sheets', (e, result) => {
+  tdocSheets.value = result || null
+})
+ipc.send('tdoc_get_state')
+export const tdocLoadState = () => ipc.send('tdoc_get_state')
+export const tdocSaveSettings = (data) => ipc.send('tdoc_save_settings', data)
+export const tdocListSheets = (data) => ipc.send('tdoc_list_sheets', data || {})
+export const tdocSyncNow = () => ipc.send('tdoc_sync_now')
+export const tdocImport = (id) => ipc.send('tdoc_import', { id })
+export const tdocImportAll = () => ipc.send('tdoc_import_all')
+export const tdocPush = (id) => ipc.send('tdoc_push', { id })
+export const tdocResolve = (id, cond, useSheet) =>
+  ipc.send('tdoc_resolve', { id, cond, useSheet })
