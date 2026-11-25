@@ -143,6 +143,19 @@ function registerInventoryIpc(ctx) {
       e.sender.send('listing_result', { ok: false, error: '状態の値が不正です。' })
       return
     }
+    // 出品IDがないレコード（下架・取消しでIDが消えたもの）を「出品中」
+    // にすると、リンクなしで出品中という壊れた状態になる（A342 で
+    // 発生）。手動変更では許可しない。
+    if (state === 'live' && ctx.inventory) {
+      const rec = await ctx.inventory.getListing((data || {}).id).catch(() => null)
+      if (rec && !rec.listing_id) {
+        e.sender.send('listing_result', {
+          ok: false,
+          error: '出品IDがないレコードは「出品中」にできません。',
+        })
+        return
+      }
+    }
     const result = ctx.inventory
       ? await ctx.inventory.updateListing((data || {}).id, {
           listing_state: state,

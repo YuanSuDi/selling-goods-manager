@@ -346,8 +346,18 @@ function createManagerServer(options) {
         if (!listingId) {
           return sendJson(res, 400, { ok: false, error: "listingId or listingUrl is required" });
         }
+        const linkedTask = body.taskId ? tasks.get(String(body.taskId)) : null;
         const claimResult = onOwnershipClaim
-          ? await onOwnershipClaim({ nodeId: reqNodeId, platform, listingId, taskId: body.taskId || null })
+          ? await onOwnershipClaim({
+              nodeId: reqNodeId,
+              platform,
+              listingId,
+              taskId: body.taskId || null,
+              // 陳腐化ガード用: 確認タスクの作成時刻。ハンドラ側で
+              // レコードの state_at と比べ、タスク作成後に状態が変わって
+              // いたら古い探査結果で上書きしない。
+              taskCreatedAt: linkedTask ? linkedTask.createdAt || null : null,
+            })
           : { ok: false, assigned: false };
         // 紐付く所有権確認タスクがあれば完了にする。
         if (claimResult && claimResult.assigned && body.taskId) {

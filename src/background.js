@@ -759,6 +759,27 @@ function startManagerServer() {
     if (!inventory || !claim || !claim.nodeId) return { ok: false, assigned: false }
     const record = await inventory.findRecordByListingId(claim.platform, claim.listingId)
     if (!record) return { ok: true, assigned: false }
+    // 陳腐化ガード（2026-11-25, A342/A256）: 確認タスクが作られた後に
+    // レコードの状態が変わっていたら（手動で「販売済」にした、売却が
+    // 入った、下架された等）、この探査結果は古い。状態の反転と下架
+    // 判定は行わない。タスクに紐付かない申告（出品中リストの走査に
+    // よる自己申告）はリアルタイムなので対象外。
+    const stale =
+      !!claim.taskCreatedAt &&
+      !!record.state_at &&
+      String(record.state_at) > String(claim.taskCreatedAt)
+    if (stale) {
+      // 未割当なら担当の割当だけは所有の証拠として生かす（状態は
+      // 触らない）。割当済み・競合の場合は何もしない。
+      if (!record.node_id) {
+        await inventory.updateListing(record._id, { node_id: claim.nodeId })
+        return { ok: true, assigned: true, stale: true }
+      }
+      if (record.node_id === claim.nodeId) {
+        return { ok: true, assigned: true, already: true, stale: true }
+      }
+      return { ok: true, assigned: false, conflict: true, stale: true }
+    }
     if (record.node_id === claim.nodeId) {
       // 担当ノード本人が「出品中リストで見た」と申告してきた時点で、
       // そのリンクが生きている証拠になる。状態が「販売済」等に

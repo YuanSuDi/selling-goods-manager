@@ -110,7 +110,30 @@ function createDelist(ctx) {
     if (!ctx.inventory || !ctx.managerServer || !productNo || !conditionId) return out
     const product = await ctx.dbFindOne(ctx.db, { product_no: productNo })
     if (!product) return out
-    const stock = Math.max(0, Number((product.condition_stock || {})[conditionId] || 0))
+    // 在庫エントリ自体がない状態は「在庫0」とは別物。レコードの状態と
+    // 在庫の状態がズレている可能性が高く（A256: 在庫は「新品」に6件
+    // あるのにレコードが「坏的」に紐付き、在庫0と誤判定して出品を
+    // 取り消した）、0とみなして自動下架するのは危険。自動下架はせず
+    // 手動確認に回す。エントリがあり値が0の場合は通常どおり判定する。
+    const stockMap = product.condition_stock || {}
+    if (!Object.prototype.hasOwnProperty.call(stockMap, conditionId)) {
+      const mine0 = (await ctx.inventory.listListings(productNo)).filter(
+        (r) => r.condition_id === conditionId
+      )
+      const live0 = mine0.filter((r) => r.listing_id && r.listing_state === 'live')
+      if (live0.length) {
+        out.manual = ensureManualDelistEntry({
+          product_no: productNo,
+          condition_id: conditionId,
+          platform: mine0.length ? mine0[0].platform : 'mercari',
+          reason:
+            'この状態の在庫エントリがないため自動下架をスキップしました。' +
+            'レコードの状態と在庫の状態が合っているか確認してください。',
+        })
+      }
+      return out
+    }
+    const stock = Math.max(0, Number(stockMap[conditionId] || 0))
     const records = await ctx.inventory.listListings(productNo)
     const mine = records.filter((r) => r.condition_id === conditionId)
     const live = mine.filter((r) => r.listing_id && r.listing_state === 'live')
