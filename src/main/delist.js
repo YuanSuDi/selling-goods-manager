@@ -24,7 +24,7 @@ function createDelist(ctx) {
       // pending だという理由で下架対象から外すと、確認をきっかけに
       // 走った下架判定が自分自身にブロックされる（A342 で発生）。
       if (
-        (t.type === 'relist' || t.type === 'delist') &&
+        (t.type === 'relist' || t.type === 'delist' || t.type === 'resume') &&
         (t.status === 'pending' || t.status === 'running') &&
         t.listing_id
       ) {

@@ -11,6 +11,7 @@
     recordsFor, recordsForCondition, conditionStock, conditionSold, stockedConditions,
     platformName, saveCondition, deleteConditionById, saveListing, deleteListingById,
     relistListing, claimListing, fixListingNode, setListingState,
+    delistListingNow, relistListingNow,
     taskList,
   } from '../store';
   import HealthCheckPanel from './HealthCheckPanel.vue';
@@ -662,6 +663,20 @@
                     :disabled="conditionStock(refDetailProduct, cond._id) <= 0"
                     @click="relistListing(r._id)"
                   >補充出品</a-button>
+                  <a-popconfirm
+                    v-if="r.listing_id && r.listing_state === 'live'"
+                    :title="r.platform === 'yahoo' ? 'この出品を取り消しますか？（元に戻せません）' : 'この出品を一時停止しますか？'"
+                    ok-text="下架する"
+                    cancel-text="キャンセル"
+                    @confirm="delistListingNow(r._id)"
+                  >
+                    <a-button size="small">下架</a-button>
+                  </a-popconfirm>
+                  <a-button
+                    v-if="r.listing_state !== 'live' && (r.listing_url || r.listing_id)"
+                    size="small"
+                    @click="relistListingNow(r._id)"
+                  >再上架</a-button>
                   <a-button v-if="!r.node_id || (r.listing_id && r.listing_state !== 'live')" size="small" @click="claimListing(r._id)">所有権を確認</a-button>
                   <a-select
                     size="small"

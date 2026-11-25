@@ -98,11 +98,12 @@ function createManagerServer(options) {
       body.type === "relist" ? "relist"
       : body.type === "verify" ? "verify"
       : body.type === "delist" ? "delist"
+      : body.type === "resume" ? "resume"
       : body.type === "manual-delist" ? "manual-delist"
       : body.type === "healthscan" ? "healthscan"
       : "listing";
-    if ((type === "relist" || type === "verify" || type === "delist") && !body.itemUrl) {
-      throw new Error("itemUrl is required for relist/verify/delist tasks");
+    if ((type === "relist" || type === "verify" || type === "delist" || type === "resume") && !body.itemUrl) {
+      throw new Error("itemUrl is required for relist/verify/delist/resume tasks");
     }
     if (type === "listing" && !body.title) {
       throw new Error("title is required");
@@ -122,7 +123,7 @@ function createManagerServer(options) {
       attemptedBy: [],
       claimedBy: null,
       itemUrl:
-        type === "relist" || type === "verify" || type === "delist" || type === "manual-delist"
+        type === "relist" || type === "verify" || type === "delist" || type === "resume" || type === "manual-delist"
           ? body.itemUrl
             ? String(body.itemUrl)
             : null

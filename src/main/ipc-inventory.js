@@ -86,6 +86,75 @@ function registerInventoryIpc(ctx) {
     }
   })
 
+  // 手動下架（テスト・即時実行用）: 在庫や自動下架スイッチと無関係に、
+  // このレコードの下架タスクを今すぐ作る。実行内容は自動下架と同じ
+  // （Mercari=一時停止 / Yahoo=取消し、入札時は中止）。
+  ipcMain.on('listing_delist_now', async (e, data) => {
+    try {
+      const record = ctx.inventory ? await ctx.inventory.getListing((data || {}).id) : null
+      if (!record) {
+        e.sender.send('listing_result', { ok: false, error: 'レコードが見つかりません。' })
+        return
+      }
+      if (!record.listing_id || record.listing_state !== 'live') {
+        e.sender.send('listing_result', { ok: false, error: '出品中のレコードだけ下架できます。' })
+        return
+      }
+      const task = ctx.createDelistTaskForRecord(record, 'manual')
+      e.sender.send('list_task_created', { ok: true, task, auto: false })
+    } catch (err) {
+      e.sender.send('listing_result', { ok: false, error: String((err && err.message) || err) })
+    }
+  })
+
+  // 手動再上架（テスト・即時実行用）: 「補充出品」と違い在庫ゲートを
+  // 通さない。Mercari の一時停止中レコードは「再開」タスク、それ以外
+  // （販売済・未出品など）は通常の再出品タスクを作る。
+  ipcMain.on('listing_relist_now', async (e, data) => {
+    try {
+      const record = ctx.inventory ? await ctx.inventory.getListing((data || {}).id) : null
+      if (!record) {
+        e.sender.send('listing_result', { ok: false, error: 'レコードが見つかりません。' })
+        return
+      }
+      if (record.platform === 'mercari' && record.listing_state === 'paused' && record.listing_id) {
+        if (!ctx.managerServer) throw new Error('連携サーバが起動していません')
+        for (const t of ctx.managerServer.tasks.values()) {
+          if (
+            (t.type === 'resume' || t.type === 'delist') &&
+            (t.status === 'pending' || t.status === 'running') &&
+            t.listing_id === record._id
+          ) {
+            throw new Error('このレコードの下架/再開タスクが既に実行待ちです')
+          }
+        }
+        const task = ctx.managerServer.addTask({
+          product_no: record.product_no,
+          platform: record.platform,
+          type: 'resume',
+          itemUrl: record.listing_url,
+          autoSubmit: true,
+          trigger: 'manual',
+          condition_id: record.condition_id,
+          listing_id: record._id,
+          node_id: record.node_id || '',
+        })
+        ctx.persistTask(task)
+        ctx.sendTaskList()
+        e.sender.send('list_task_created', { ok: true, task, auto: false })
+        return
+      }
+      if (record.listing_state === 'live') {
+        e.sender.send('listing_result', { ok: false, error: '既に出品中です。' })
+        return
+      }
+      const task = ctx.createRelistTaskForRecord(record, true, 'manual')
+      e.sender.send('list_task_created', { ok: true, task, auto: false })
+    } catch (err) {
+      e.sender.send('listing_result', { ok: false, error: String((err && err.message) || err) })
+    }
+  })
+
   ipcMain.on('listing_claim', async (e, data) => {
     try {
       if (!ctx.managerServer) throw new Error('連携サーバが起動していません')

@@ -1036,6 +1036,153 @@ async function executeMercariDelistTask(cfg, task) {
   }
 }
 
+// Mercari の一時停止を解除する（再上架＝再開）。下架タスクの鏡像:
+// 商品ページで所有権を確認 → 編集ページで「出品を再開する」系ボタン
+// → 任意の確認モーダル → 編集ページを開き直して「出品を一時停止する」
+// に戻っていることを検証する。ボタンの実文言は未確認のため、再開を
+// 含むラベルを広めに拾い、検証で fail-closed にする。
+async function executeMercariResumeTask(cfg, task) {
+  const stopKeepAlive = startKeepAlive();
+  const postResult = async (ok, message) => {
+    try {
+      await managerFetch(cfg, "/api/tasks/" + encodeURIComponent(task.id) + "/result", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ok: !!ok,
+          listingUrl: null,
+          message: message || null,
+          hasBids: false,
+          paused: false,
+        }),
+      });
+    } catch (e) {
+      console.warn("[FurimaCopy] resume result post failed", e);
+    }
+    await setManagerConfig({
+      lastStatus: (ok ? "再上架完了: " : "再上架失敗: ") + (message || task.id),
+    });
+  };
+  let tabId = null;
+  try {
+    await managerFetch(cfg, "/api/tasks/" + encodeURIComponent(task.id) + "/claim", {
+      method: "POST",
+    });
+    await setManagerConfig({ lastStatus: "再上架実行中: " + (task.title || task.id) });
+    const itemId = (String(task.itemUrl || "").match(/(m\d+)/) || [])[1];
+    if (!itemId) throw new Error("タスクの商品 ID を特定できませんでした: " + (task.itemUrl || ""));
+    const tab = await chrome.tabs.create({ url: task.itemUrl, active: true });
+    tabId = tab.id;
+    try {
+      await chrome.tabs.update(tabId, { autoDiscardable: false });
+    } catch (e) {
+      /* noop */
+    }
+    await waitForTabComplete(tabId, 45000);
+    await remoteSleep(2500);
+    // 所有権ゲート（下架と同じ）。
+    const probe = await probeMercariOwnership(tabId);
+    if (!probe.isOwner) {
+      await releaseManagerTask(cfg, task, "not-owner");
+      await setManagerConfig({
+        lastStatus: "再上架をキューへ返却（所有権なし）: " + itemId,
+      });
+      return;
+    }
+    // 編集ページへ直行する。
+    await chrome.tabs.update(tabId, {
+      url: "https://jp.mercari.com/sell/edit/" + encodeURIComponent(itemId),
+      active: true,
+    });
+    await waitForTabComplete(tabId, 45000);
+    await remoteSleep(2500);
+    const resumeAction = await chrome.scripting
+      .executeScript({
+        target: { tabId },
+        func: () => {
+          const visible = (el) => {
+            const s = getComputedStyle(el);
+            return s.display !== "none" && s.visibility !== "hidden" && el.getClientRects().length > 0;
+          };
+          const cands = Array.from(document.querySelectorAll('a, button, [role="button"]')).filter(visible);
+          const texts = cands.map((el) => String(el.innerText || "").replace(/\s+/g, " ").trim());
+          if (texts.some((t) => t === "出品を一時停止する")) return "already";
+          const idx = texts.findIndex((t) => t.includes("再開"));
+          if (idx < 0) return "missing";
+          cands[idx].scrollIntoView({ block: "center" });
+          cands[idx].click();
+          return "clicked";
+        },
+      })
+      .then((r) => (r[0] && r[0].result) || "missing")
+      .catch(() => "missing");
+    if (resumeAction === "already") {
+      await postResult(true, "既に出品中でした: " + itemId);
+      return;
+    }
+    if (resumeAction !== "clicked") throw new Error("再開ボタンが見つかりませんでした（停止中ではない可能性）");
+    await remoteSleep(1800);
+    // 確認モーダルが出た場合だけ、その「再開する」を押す
+    // （キャンセル側は絶対に押さない）。
+    await chrome.scripting
+      .executeScript({
+        target: { tabId },
+        func: () => {
+          const visible = (el) => {
+            const s = getComputedStyle(el);
+            return s.display !== "none" && s.visibility !== "hidden" && el.getClientRects().length > 0;
+          };
+          const cands = Array.from(document.querySelectorAll('button, [role="button"]')).filter(visible);
+          const hit = cands.find((el) => {
+            const t = String(el.innerText || "").replace(/\s+/g, " ").trim();
+            return t === "再開する" || t === "出品を再開する";
+          });
+          if (!hit) return false;
+          hit.click();
+          return true;
+        },
+      })
+      .catch(() => false);
+    await remoteSleep(2000);
+    // 検証: 編集ページを開き直し、「出品を一時停止する」に戻っていて
+    // 「再開」ボタンが消えていることを確かめる。
+    await chrome.tabs.update(tabId, {
+      url: "https://jp.mercari.com/sell/edit/" + encodeURIComponent(itemId),
+      active: true,
+    });
+    await waitForTabComplete(tabId, 45000);
+    await remoteSleep(2500);
+    const verified = await chrome.scripting
+      .executeScript({
+        target: { tabId },
+        func: () => {
+          const visible = (el) => {
+            const s = getComputedStyle(el);
+            return s.display !== "none" && s.visibility !== "hidden" && el.getClientRects().length > 0;
+          };
+          const cands = Array.from(document.querySelectorAll('a, button, [role="button"]')).filter(visible);
+          const labels = cands.map((el) => String(el.innerText || "").replace(/\s+/g, " ").trim());
+          const hasPause = labels.some((t) => t === "出品を一時停止する");
+          const hasResume = labels.some((t) => t.includes("再開"));
+          return hasPause && !hasResume;
+        },
+      })
+      .then((r) => !!(r[0] && r[0].result))
+      .catch(() => false);
+    if (!verified) throw new Error("再開を確認できませんでした（編集ページが出品中状態になっていません）");
+    await postResult(true, "出品を再開しました: " + itemId);
+  } catch (e) {
+    await postResult(false, String((e && e.message) || e));
+  } finally {
+    if (tabId != null) {
+      try {
+        await chrome.tabs.remove(tabId);
+      } catch (e) {}
+    }
+    stopKeepAlive();
+  }
+}
+
 // Yahoo 商品ページから入札件数を読み取る。読めなければ null（=中止）。
 async function readYahooBidCount(tabId) {
   const results = await chrome.scripting
@@ -1327,6 +1474,7 @@ async function pollManagerTasks(why) {
   try {
     if (task.type === "verify") await executeVerifyTask(cfg, task);
     else if (task.type === "healthscan") await executeHealthScanTask(cfg, task);
+    else if (task.type === "resume") await executeMercariResumeTask(cfg, task);
     else if (task.type === "delist" && task.platform === "yahoo")
       await executeYahooDelistTask(cfg, task);
     else if (task.type === "delist") await executeMercariDelistTask(cfg, task);

@@ -495,6 +495,39 @@ function startManagerServer() {
     } else refreshRenderer()
   }
 
+  // 再上架（再開）タスクの結果反映: 成功で「出品中」に戻し、失敗は
+  // エラーをレコードに残す（下架の失敗反映と同じ流儀）。
+  const applyResumeResultToRecord = async (task, record) => {
+    const bind = platformBinding(record.platform)
+    const isDefaultRecord = record.condition_id === defaultConditionId
+    const now = new Date().toISOString()
+    if (task.result && task.result.ok) {
+      await inventory.updateListing(record._id, {
+        listing_state: 'live',
+        state_at: now,
+        error: null,
+        status: 'active',
+      })
+      if (isDefaultRecord) {
+        db.update(
+          { product_no: record.product_no },
+          { $set: { [bind.errorField]: null } },
+          () => refreshRenderer()
+        )
+      } else refreshRenderer()
+      return
+    }
+    const msg = (task.result && task.result.message) || '再上架に失敗しました'
+    await inventory.updateListing(record._id, { error: msg, status: 'error', state_at: now })
+    if (isDefaultRecord) {
+      db.update(
+        { product_no: record.product_no },
+        { $set: { [bind.errorField]: msg } },
+        () => refreshRenderer()
+      )
+    } else refreshRenderer()
+  }
+
   // 再出品タスクの結果を受けたら、商品の参照 URL を新しい出品 URL で
   // 上書きする（成功時）。失敗時はエラー内容を商品に残し、自動では
   // 再試行しない（次は手動で出品し直す）。
@@ -516,6 +549,16 @@ function startManagerServer() {
         persistTask(task)
         sendTaskList()
         await applyDelistResultToRecord(task, record)
+        sendInventoryMeta()
+        return
+      }
+    }
+    if (inventory && task && task.type === 'resume' && task.listing_id) {
+      const record = await inventory.getListing(task.listing_id)
+      if (record) {
+        persistTask(task)
+        sendTaskList()
+        await applyResumeResultToRecord(task, record)
         sendInventoryMeta()
         return
       }

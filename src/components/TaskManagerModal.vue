@@ -154,7 +154,8 @@
         <template v-else-if="column.key === 'platform'">
           <a-tag :color="record.platform === 'yahoo' ? 'orange' : 'blue'">{{ platformName(record.platform) }}</a-tag>
           <div v-if="record.type === 'verify'" class="task-node-sub">所有権確認</div>
-          <div v-if="record.type === 'delist'" class="task-node-sub">自動下架</div>
+          <div v-if="record.type === 'delist'" class="task-node-sub">{{ record.trigger === 'manual' ? '手動下架' : '自動下架' }}</div>
+          <div v-if="record.type === 'resume'" class="task-node-sub">再上架（再開）</div>
           <div v-if="record.type === 'manual-delist'" class="task-node-sub">手動下架</div>
         </template>
         <template v-else-if="column.key === 'itemUrl'">
