@@ -293,11 +293,32 @@ async function managerFetch(cfg, path, init) {
   return res.json();
 }
 
+// 最小化されたウィンドウでは Chrome がページ描画を止め・タイマーを
+// 絞るため、自動操作（要素の探索や表示判定）が軒並み失敗する
+// （2026-11-25 ユーザー報告）。タスクやスキャンの実行前に、作業対象の
+// ウィンドウが最小化されていたら通常状態へ戻す。フォーカスは奪わない。
+// 戻した窓はそのまま（自動で再最小化はしない）。
+async function ensureWorkWindowVisible() {
+  try {
+    const win = await chrome.windows.getLastFocused().catch(() => null);
+    if (win && win.state === "minimized") {
+      await chrome.windows.update(win.id, { state: "normal" });
+      console.log("[FurimaCopy] restored minimized window", win.id);
+      await remoteSleep(800);
+      return true;
+    }
+  } catch (e) {
+    console.warn("[FurimaCopy] window restore failed", e);
+  }
+  return false;
+}
+
 async function scanMercariSoldTodos(cfg, force) {
   if (!cfg.todoScanEnabled && !force) return { ok: true, skipped: true };
   if (soldScanRunning) return { ok: false, error: "Todo 扫描正在进行中" };
   soldScanRunning = true;
   const stopKeepAlive = startKeepAlive();
+  await ensureWorkWindowVisible();
   let todosTab = null;
   let cards = [];
   let matched = 0;
@@ -390,6 +411,7 @@ async function scanYahooSold(cfg, force) {
   if (yahooScanRunning) return { ok: false, error: "Yahoo 扫描正在进行中" };
   yahooScanRunning = true;
   const stopKeepAlive = startKeepAlive();
+  await ensureWorkWindowVisible();
   let scanTab = null;
   let found = 0;
   let matched = 0;
@@ -1471,6 +1493,7 @@ async function pollManagerTasks(why) {
     return;
   }
   managerRunning = true;
+  await ensureWorkWindowVisible();
   try {
     if (task.type === "verify") await executeVerifyTask(cfg, task);
     else if (task.type === "healthscan") await executeHealthScanTask(cfg, task);
