@@ -801,10 +801,12 @@ async function executeYahooManagerTask(cfg, task) {
     }
     const workTab = await chrome.tabs.create({ active: true });
     workTabId = workTab.id;
-    // Yahoo の再出品は新しいオークション ID で公開される。送信後に
-    // 出品中一覧でタイトルから新しい ID を特定するため、先に旧商品
-    // ページでタイトルを取得しておく。
-    const itemTitle = await getYahooAuctionTitle(workTabId, itemId);
+    // 旧商品ページでタイトルと落札有無を取得しておく。落札者がいた
+    // 終了だけが再出品で新しい ID になり、その場合のみ送信後に
+    // 出品中一覧でタイトルから新しい ID を特定する。落札者なしの
+    // 終了は同一 ID で再開されるため一覧確認は不要。
+    const auctionInfo = await getYahooAuctionInfo(workTabId, itemId);
+    const itemTitle = auctionInfo.title;
     // v0.12.0 所有権ゲート: 再出品ページが操作できなければ他アカウントの
     // 商品とみなし、タスクを失敗にせずキューへ返却する。
     await chrome.tabs.update(workTabId, {
@@ -846,10 +848,14 @@ async function executeYahooManagerTask(cfg, task) {
       });
       return;
     }
-    const relistRes = await processYahooRelistItem(workTabId, {
-      id: itemId,
-      title: itemTitle || "",
-    });
+    const relistRes = await processYahooRelistItem(
+      workTabId,
+      {
+        id: itemId,
+        title: itemTitle || "",
+      },
+      { winnerKnown: auctionInfo.winner }
+    );
     const newId = (relistRes && relistRes.listingId) || itemId;
     await postResult(
       true,
@@ -2837,12 +2843,18 @@ async function resolveYahooRelistedId(tabId, oldId, title) {
 
 // 終了したオークションの商品ページからタイトルを取得する（再出品後の
 // 新 ID 特定に使う）。取得できなければ空文字。
-async function getYahooAuctionTitle(tabId, itemId) {
+// 終了したオークションの商品ページからタイトルと「落札者がいたか」を
+// 取得する。落札の判定材料: 落札者/落札価格の表示がある、または入札件数
+// が 1 件以上なら落札者あり。入札 0 件で落札表示が無ければ落札者なし。
+// どちらとも取れなければ winner=null（呼び出し側は一覧確認にフォール
+// バックする）。落札者なしの再出品は同一 ID で再開されるため、完了
+// ページ到達だけで成功とできる（ユーザー指定 2026-11-26）。
+async function getYahooAuctionInfo(tabId, itemId) {
   await chrome.tabs.update(tabId, {
     url: "https://auctions.yahoo.co.jp/jp/auction/" + encodeURIComponent(itemId),
     active: true,
   });
-  if (!(await waitForTabComplete(tabId, 45000))) return "";
+  if (!(await waitForTabComplete(tabId, 45000))) return { title: "", winner: null };
   await remoteSleep(1500);
   try {
     const results = await chrome.scripting.executeScript({
@@ -2859,13 +2871,30 @@ async function getYahooAuctionTitle(tabId, itemId) {
             .replace(/\s*-\s*Yahoo!オークション.*$/, "")
             .trim();
         }
-        return t;
+        const body = String(
+          document.body ? document.body.innerText || "" : ""
+        );
+        const bidMatch = body.match(/入札件数\s*[:：]?\s*(\d+)\s*件/);
+        const bids = bidMatch ? parseInt(bidMatch[1], 10) : null;
+        const hasWinnerMark = /落札者\s*[:：]|落札価格\s*[:：]/.test(body);
+        let winner = null;
+        if (hasWinnerMark || (bids !== null && bids > 0)) winner = true;
+        else if (bids === 0) winner = false;
+        return { title: t, winner };
       },
     });
-    return (results[0] && results[0].result) || "";
+    const r = results[0] && results[0].result;
+    return r && typeof r === "object"
+      ? { title: r.title || "", winner: r.winner }
+      : { title: "", winner: null };
   } catch (e) {
-    return "";
+    return { title: "", winner: null };
   }
+}
+
+async function getYahooAuctionTitle(tabId, itemId) {
+  const info = await getYahooAuctionInfo(tabId, itemId);
+  return info.title;
 }
 
 async function processYahooRelistItem(tabId, item, opts) {
@@ -2927,8 +2956,9 @@ async function processYahooRelistItem(tabId, item, opts) {
       return { success: true, listingId: page.listingId };
     }
     if (page.status === "success" || page.status === "verify") {
-      if (skipListVerify) {
-        // 落札者なし再出品: 完了ページ到達 = 成功。同一 ID で再開される。
+      if (skipListVerify || (opts && opts.winnerKnown === false)) {
+        // 落札者なし再出品: 完了ページ到達 = 成功。同一 ID で再開される
+        // ため出品中一覧の確認はしない（ユーザー指定 2026-11-26）。
         return { success: true, listingId: item.id };
       }
       // Yahoo の再出品は新しいオークション ID で公開される。タイトルで
