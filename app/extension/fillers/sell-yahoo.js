@@ -1223,6 +1223,33 @@
       });
     }
 
+    // 終了する日時: 日付だけ最遅を選ぶ。時刻（ClosingTime）は触らない
+    // （ユーザー指定 2026-11-26）。select[name="ClosingYMD"] はネイティブ
+    // select で、option の value は YYYY-MM-DD（文字列の最大 = 最遅日）。
+    {
+      const dateSel = document.querySelector('select[name="ClosingYMD"]');
+      let latest = null;
+      if (dateSel) {
+        for (const opt of Array.from(dateSel.options)) {
+          if (opt.value && (!latest || opt.value > latest.value)) latest = opt;
+        }
+      }
+      let ok = false;
+      if (dateSel && latest) {
+        if (dateSel.value !== latest.value) {
+          FF.trySelectByText(dateSel, [latest.textContent.trim()]);
+        }
+        ok = dateSel.value === latest.value;
+      }
+      lines.push({
+        label: "終了する日時",
+        status: ok ? "ok" : "manual",
+        note: ok
+          ? latest.textContent.trim() + "（最遅の日付・時刻は変更なし）"
+          : "手動で選択してください",
+      });
+    }
+
     // カテゴリ: 選択済みで候補と一致すれば OK。未選択なら保留データを置き、
     // このページの入力を全部終えたあとで選択ページへ遷移する（最後に処理）。
     let pendingCategoryNav = null;
