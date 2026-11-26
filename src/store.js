@@ -574,8 +574,8 @@ export const tdocLoadState = () => ipc.send('tdoc_get_state')
 export const tdocSaveSettings = (data) => ipc.send('tdoc_save_settings', data)
 export const tdocListSheets = (data) => ipc.send('tdoc_list_sheets', data || {})
 export const tdocSyncNow = () => ipc.send('tdoc_sync_now')
-export const tdocImport = (id) => ipc.send('tdoc_import', { id })
+export const tdocImport = (id, sheetId) => ipc.send('tdoc_import', { id, sheetId })
 export const tdocImportAll = () => ipc.send('tdoc_import_all')
-export const tdocPush = (id) => ipc.send('tdoc_push', { id })
-export const tdocResolve = (id, cond, useSheet) =>
-  ipc.send('tdoc_resolve', { id, cond, useSheet })
+export const tdocPush = (id, sheetId) => ipc.send('tdoc_push', { id, sheetId })
+export const tdocResolve = (id, cond, useSheet, sheetId) =>
+  ipc.send('tdoc_resolve', { id, cond, useSheet, sheetId })
