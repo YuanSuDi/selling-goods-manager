@@ -2380,9 +2380,16 @@ async function scanSellingListForItem(tabId, itemId) {
 }
 
 // 出品中一覧を全ページ走査し、{id, title} の一覧を返す。
-async function scanSellingListEntries(tabId) {
+// 出品中一覧は「残り時間の長い順」（s1=end_time&o1=d）で開く:
+// 出品したばかりの商品は残り時間が最長なので先頭ページに来る
+// （ユーザー指定 2026-11-26）。stopWhen(entries) が true を返したら
+// そのページで走査を打ち切る（同一 ID の早期発見用）。
+const YAHOO_SELLING_SORTED_URL =
+  "https://auctions.yahoo.co.jp/my/selling?s1=end_time&o1=d";
+
+async function scanSellingListEntries(tabId, stopWhen) {
   await chrome.tabs.update(tabId, {
-    url: "https://auctions.yahoo.co.jp/my/selling",
+    url: YAHOO_SELLING_SORTED_URL,
     active: true,
   });
   if (!(await waitForTabComplete(tabId, 45000))) return null;
@@ -2438,6 +2445,7 @@ async function scanSellingListEntries(tabId) {
         byId.set(e.id, e);
       }
     }
+    if (stopWhen && stopWhen(Array.from(byId.values()))) break;
     if (!r.nextUrl) break;
     await chrome.tabs.update(tabId, { url: r.nextUrl, active: true });
     if (!(await waitForTabComplete(tabId, 45000))) break;
@@ -2452,7 +2460,7 @@ async function scanSellingListEntries(tabId) {
 // ことをもって初めてレコードの死を疑うため、この区別が要る。
 async function scanSellingListEntriesEx(tabId) {
   await chrome.tabs.update(tabId, {
-    url: "https://auctions.yahoo.co.jp/my/selling",
+    url: YAHOO_SELLING_SORTED_URL,
     active: true,
   });
   if (!(await waitForTabComplete(tabId, 45000))) return null;
@@ -2725,7 +2733,12 @@ function titlesMatch(a, b) {
 // 一覧への反映遅延に備えて数ラウンド待つ。
 async function resolveYahooRelistedId(tabId, oldId, title) {
   for (let round = 0; round < 8; round++) {
-    const entries = await scanSellingListEntries(tabId);
+    // 同一 ID で再開された場合は最初のページで見つかるので早期終了する。
+    // 新 ID のタイトル照合は同名出品との取り違えを避けるため全ページ走査が要る。
+    const entries = await scanSellingListEntries(
+      tabId,
+      (list) => list.some((e) => e.id === oldId)
+    );
     if (entries) {
       if (entries.some((e) => e.id === oldId)) return oldId;
       if (title) {
