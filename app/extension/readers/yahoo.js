@@ -335,76 +335,121 @@
   // select）ため、{ name: 接頭辞なし名称, official: bool } で返す。
   // 読めなければ null（従来の単一読みに委ねる）。コピーを止めない。
   async function readShippingMethodsFromPopup() {
-    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-    // position:fixed のモーダルは offsetParent が null になるため使わない。
-    const isVis = (el) => {
-      const r = el.getBoundingClientRect();
-      const st = getComputedStyle(el);
-      return (
-        r.width > 0 && r.height > 0 && st.display !== "none" && st.visibility !== "hidden"
+    const parseMethodText = (raw0) => {
+      const raw = (raw0 || "").replace(/\s+/g, " ").trim();
+      if (!raw || raw.length > 60) return null;
+      let official = false;
+      let rest = raw;
+      if (rest.startsWith("おてがる配送")) {
+        official = true;
+        rest = rest.slice("おてがる配送".length).trim();
+      }
+      const name = SHIP_METHOD_NAMES.find(
+        (n) => rest === n || (rest.startsWith(n) && rest.length - n.length <= 30)
       );
+      return name ? { name, official } : null;
+    };
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    // 実 DOM（2026-11-26 ユーザーが DevTools / コンソールで実証）:
+    // ポップアップは同ページ内の <dialog>（#modalArea 内）だが、方法の
+    // li > dl > dt は「開くまで DOM に存在しない」（未展開で query すると
+    // 0 件）。一度開けば内容は DOM に残る。開くのは <button> の
+    // 「配送方法の詳細」。素の .click() では about:blank タブが開く
+    // 副作用があったため、座標付きのイベント列で人間らしく押す。
+    const readFromDialog = () => {
+      const dialog = Array.from(
+        document.querySelectorAll("#modalArea dialog, dialog")
+      ).find((d) => (d.textContent || "").includes("配送方法と送料"));
+      if (!dialog) return null;
+      const methods = [];
+      const seen = new Set();
+      for (const dt of dialog.querySelectorAll("li dt")) {
+        const m = parseMethodText(dt.textContent || "");
+        if (!m) continue;
+        const key = (m.official ? "o:" : "p:") + m.name;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        methods.push(m);
+      }
+      if (!methods.length) {
+        const els = Array.from(
+          dialog.querySelectorAll("th, td, dd, li, div, p, span")
+        );
+        const byKey = new Map();
+        els.forEach((el, idx) => {
+          const m = parseMethodText(el.textContent || "");
+          if (!m) return;
+          const key = (m.official ? "o:" : "p:") + m.name;
+          const prev = byKey.get(key);
+          const len = (el.textContent || "").length;
+          if (!prev || len < prev.len) byKey.set(key, { ...m, len, idx });
+        });
+        Array.from(byKey.values())
+          .sort((a, b) => a.idx - b.idx)
+          .forEach((m) => methods.push({ name: m.name, official: m.official }));
+      }
+      return methods.length ? { dialog, methods } : null;
+    };
+    const humanClick = (el) => {
+      try {
+        el.scrollIntoView({ block: "center" });
+        const r = el.getBoundingClientRect();
+        const x = r.left + r.width / 2;
+        const y = r.top + r.height / 2;
+        const t = document.elementFromPoint(x, y) || el;
+        const opts = {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+          clientX: x,
+          clientY: y,
+          button: 0,
+        };
+        for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+          t.dispatchEvent(new MouseEvent(type, opts));
+        }
+      } catch (e) { /* noop */ }
     };
     try {
-      const trigger = Array.from(
-        document.querySelectorAll("a, button, span, div, li")
-      ).find((el) => {
-        if (!isVis(el)) return false;
-        const t = (el.textContent || "").replace(/\s+/g, "").trim();
-        return t === "配送方法の詳細";
-      });
-      if (!trigger) return null;
-      trigger.click();
-      let popup = null;
-      for (let i = 0; i < 20 && !popup; i++) {
+      // 1) 既に開かれたことがある等で内容が DOM にあれば、そのまま読む。
+      const already = readFromDialog();
+      if (already) return already.methods;
+      // 2) 「配送方法の詳細」ボタン（<span> を包む <button>）を開く。
+      const btn =
+        Array.from(document.querySelectorAll("button")).find(
+          (b) => (b.textContent || "").replace(/\s+/g, "").trim() === "配送方法の詳細"
+        ) ||
+        Array.from(document.querySelectorAll("a, span, div, li")).find((el) => {
+          const t = (el.textContent || "").replace(/\s+/g, "").trim();
+          return t === "配送方法の詳細";
+        });
+      if (!btn) return null;
+      humanClick(btn);
+      let got = null;
+      for (let i = 0; i < 16 && !got; i++) {
         await sleep(250);
-        const cands = Array.from(document.querySelectorAll("div, section, table"))
-          .filter((el) => {
-            if (!isVis(el)) return false;
-            const t = el.textContent || "";
-            return t.includes("配送方法と送料") && t.length < 4000;
-          })
-          .sort(
-            (a, b) =>
-              (a.textContent || "").length - (b.textContent || "").length
-          );
-        popup = cands[0] || null;
+        got = readFromDialog();
       }
-      if (!popup) return null;
-      const els = Array.from(
-        popup.querySelectorAll("th, td, dt, dd, li, div, p, span")
-      );
-      const byKey = new Map();
-      els.forEach((el, idx) => {
-        const raw = (el.textContent || "").replace(/\s+/g, " ").trim();
-        if (!raw || raw.length > 60) return;
-        let official = false;
-        let rest = raw;
-        if (rest.startsWith("おてがる配送")) {
-          official = true;
-          rest = rest.slice("おてがる配送".length).trim();
+      if (!got) {
+        // 座標クリックで開かなければ native click を 1 回だけ試す。
+        try { btn.click(); } catch (e) { /* noop */ }
+        for (let i = 0; i < 16 && !got; i++) {
+          await sleep(250);
+          got = readFromDialog();
         }
-        const name = SHIP_METHOD_NAMES.find(
-          (n) => rest === n || (rest.startsWith(n) && rest.length - n.length <= 30)
-        );
-        if (!name) return;
-        const key = (official ? "o:" : "p:") + name;
-        const prev = byKey.get(key);
-        if (!prev || raw.length < prev.len) {
-          byKey.set(key, { name, official, len: raw.length, idx });
-        }
-      });
-      const methods = Array.from(byKey.values())
-        .sort((a, b) => a.idx - b.idx)
-        .map((m) => ({ name: m.name, official: m.official }));
+      }
+      if (!got) return null;
+      // 3) 閉じる（読めた場合のみ）。
       const closeBtn = Array.from(
-        popup.querySelectorAll("a, button, span, div")
+        got.dialog.querySelectorAll("a, button")
       ).find(
         (el) => (el.textContent || "").replace(/\s+/g, "").trim() === "閉じる"
       );
-      if (closeBtn) {
-        try { closeBtn.click(); } catch (e) { /* 閉じられなくても致命ではない */ }
+      if (closeBtn) humanClick(closeBtn);
+      else if (typeof got.dialog.close === "function") {
+        try { got.dialog.close(); } catch (e) { /* noop */ }
       }
-      return methods.length ? methods : null;
+      return got.methods;
     } catch (e) {
       console.warn("[FurimaCopy] shipping popup read failed", e);
       return null;

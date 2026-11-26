@@ -2318,6 +2318,29 @@ async function inspectAndAdvanceYahooRelist(
       if (kind === "review" && priorReviewClicks >= 3) {
         return { status: "error", error: "確認ページが多すぎるため停止しました" };
       }
+      // 終了日は最遅にする（コピー入力側と同じ仕様、ユーザーの指定
+      // 2026-11-26）。確認へ進む直前（フォームページ）でのみ操作し、
+      // 時刻（ClosingTime）は変更しない。控件が無ければ何もしない。
+      if (!isPreviewPage) {
+        try {
+          const dateSel = document.querySelector('select[name="ClosingYMD"]');
+          if (dateSel && dateSel.options.length) {
+            let latest = null;
+            for (const o of dateSel.options) {
+              if (o.value && (!latest || o.value > latest.value)) latest = o;
+            }
+            if (latest && dateSel.value !== latest.value) {
+              const setter = Object.getOwnPropertyDescriptor(
+                window.HTMLSelectElement.prototype,
+                "value"
+              ).set;
+              setter.call(dateSel, latest.value);
+              dateSel.dispatchEvent(new Event("input", { bubbles: true }));
+              dateSel.dispatchEvent(new Event("change", { bubbles: true }));
+            }
+          }
+        } catch (e) { /* 日付に触れなくても再出品は続行する */ }
+      }
       window.__fcYahooRelistClickedFor = itemId;
       window.__fcYahooRelistClickedKind = kind;
       match.el.click();

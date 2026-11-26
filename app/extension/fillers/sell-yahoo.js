@@ -559,9 +559,12 @@
   // v0.12.33 で radio 自身の native click を本命にしたが実機で未選択
   // だったため、v0.12.34（ローカル検証版）では複数手段を順に試し、
   // 各手段の成否と radio の属性を診断文字列として返す。
-  async function selectShipMethod(method) {
+  async function selectShipMethod(method, opts) {
     const norm = (s) =>
       String(s || "").replace(/[\s　]/g, "").replace(/（EAZY）|\(EAZY\)/gi, "");
+    // prefer: "card"（おてがる）/ "other"（通常配送）/ null（従来順）。
+    // 同名でも別サービス（例: ゆうパック）を取り違えないために使う。
+    const prefer = opts && opts.prefer ? opts.prefer : null;
     // 「おてがる配送ゆうパケット」のような接頭辞付きで渡ってきても
     // カード名（接頭辞なし）に一致させる（読み取り側でも正規化するが二重化）。
     const target = norm(method).replace(/^おてがる配送/, "");
@@ -649,15 +652,37 @@
       const labels = Array.from(
         document.querySelectorAll("label.js-ship-label, label.OfficialDelivery__item")
       ).filter((el) => FF.isVisible(el));
-      for (const label of labels) {
-        const titles = Array.from(
-          label.querySelectorAll(".OfficialDelivery__itemTitle")
-        ).map((el) => norm(el.textContent || ""));
+      const titleOf = (label) =>
+        Array.from(label.querySelectorAll(".OfficialDelivery__itemTitle")).map(
+          (el) => norm(el.textContent || "")
+        );
+      // 宅急便カードのタイトルは「宅急便60〜160サイズ」のように
+      // サイズ接尾辞付きになる（会員フォームと同じ問題、実測
+      // 2026-11-26）。完全一致のカードを先に、無ければサイズ接尾辞
+      // のみのタイトルも一致として後ろに並べる。
+      const sizeSuffixHit = (titles) =>
+        titles.some(
+          (t) =>
+            t.startsWith(target) &&
+            /^\d+〜\d+サイズ$/.test(t.slice(target.length))
+        );
+      const orderedLabels = [
+        ...labels.filter((l) => titleOf(l).includes(target)),
+        ...labels.filter(
+          (l) => !titleOf(l).includes(target) && sizeSuffixHit(titleOf(l))
+        ),
+      ];
+      if (!orderedLabels.length) {
+        diag.strat.push(
+          "labels:" + labels.flatMap((l) => titleOf(l)).join("/")
+        );
+      }
+      for (const label of orderedLabels) {
+        const titles = titleOf(label);
         if (!titles.length) continue;
-        if (!titles.includes(target) && titles[0] !== target) continue;
         const radio = label.querySelector('input[type="radio"]');
         if (!radio) continue;
-        diag.tier = "label";
+        diag.tier = titles.includes(target) ? "label" : "label-size";
         diag.radio =
           "name=" + (radio.name || "-") + " id=" + (radio.id || "-") +
           " value=" + (radio.value || "-") +
@@ -787,11 +812,14 @@
       const toggleBox = async (box, want) => {
         if (box.disabled || box.checked === want) return box.checked === want;
         try { box.click(); } catch (e) { /* noop */ }
+        // checked は React の再描画で遅れて変わることがある。即断して
+        // label を押すと二度押しで戻ってしまうため、待ってから再判定。
+        await new Promise((r) => setTimeout(r, 600));
         if (box.checked !== want) {
           const l = cardOf(box);
           if (l) { try { l.click(); } catch (e) { /* noop */ } }
+          await new Promise((r) => setTimeout(r, 600));
         }
-        await new Promise((r) => setTimeout(r, 250));
         return box.checked === want;
       };
       const uncheckOthers = async (keep) => {
@@ -816,9 +844,7 @@
         return hit.box.checked && othersCleared(hit.box);
       }
       // その他（CheckExpand + select）ルート
-      const block = otherArea
-        ? otherArea.querySelector("li.CheckExpand__item") || otherArea
-        : null;
+      const block = (await ensurePlainBlock(otherArea, 0)) || otherArea;
       const otherCheck = block
         ? block.querySelector('input[type="checkbox"]')
         : null;
@@ -855,19 +881,54 @@
     const memberResult = await memberRoute();
     if (memberResult !== null) return done(memberResult);
 
-    let dRadio = findByDeliveryName();
-    if (dRadio && !FF.isVisible(dRadio)) {
+    const tryDeliveryName = async () => {
+      let r = findByDeliveryName();
+      if (r && !FF.isVisible(r)) {
+        await ensureOtherExpanded();
+        r = findByDeliveryName();
+      }
+      if (r) {
+        diag.tier = "dname";
+        setRadioDiag(r);
+        if (await clickRadioHuman(r)) return true;
+      }
+      return false;
+    };
+    // 「その他」内の radio を行テキストで探す（data-deliveryname が
+    // 無いバリアント用）。おてがるカードは対象に含めない。
+    const tryOtherScoped = async () => {
       await ensureOtherExpanded();
-      dRadio = findByDeliveryName();
+      const scope =
+        document.querySelector("#other_ship_method_area") ||
+        document.querySelector("dl.js-expand-body");
+      if (!scope) return false;
+      for (const r of scope.querySelectorAll('input[type="radio"]')) {
+        const row = r.closest("label") || r.parentElement;
+        if (norm(row ? row.textContent || "" : "") === target) {
+          diag.tier = "other-scoped";
+          setRadioDiag(r);
+          if (await clickRadioHuman(r)) return true;
+        }
+      }
+      return false;
+    };
+
+    if (prefer === "other") {
+      // 元データが通常配送: 同名のおてがるカードは別サービスなので
+      // 絶対に選ばない。見つからなければ正直に失敗を返す。
+      if (await tryDeliveryName()) return done(true);
+      if (await tryOtherScoped()) return done(true);
+      return done(false);
     }
-    if (dRadio) {
-      diag.tier = "dname";
-      setRadioDiag(dRadio);
-      if (await clickRadioHuman(dRadio)) return done(true);
-    }
-    const labelResult = await labelRoute();
-    if (labelResult !== null) return done(labelResult);
-    if (!dRadio) {
+    if (prefer === "card") {
+      const lr = await labelRoute();
+      if (lr !== null) return done(lr);
+      // カードが無ければ候補プールへ（その他は展開しないので、
+      // プールに通常配送の行は入らない）。
+    } else {
+      if (await tryDeliveryName()) return done(true);
+      const labelResult = await labelRoute();
+      if (labelResult !== null) return done(labelResult);
       await ensureOtherExpanded();
       const r2 = findByDeliveryName();
       if (r2) {
@@ -976,6 +1037,164 @@
     return done(false);
   }
 
+  // 会員フォームのおてがるカード（checkbox）一覧を返す。
+  function collectMemberCards() {
+    const norm = (s) =>
+      String(s || "").replace(/[\s　]/g, "").replace(/（EAZY）|\(EAZY\)/gi, "");
+    return Array.from(document.querySelectorAll("label.OfficialDelivery__item"))
+      .filter((el) => FF.isVisible(el))
+      .map((label) => ({
+        label,
+        box: label.querySelector('input[type="checkbox"]'),
+        titles: Array.from(
+          label.querySelectorAll(".OfficialDelivery__itemTitle")
+        ).map((el) => norm(el.textContent || "")),
+      }))
+      .filter((c) => c.box);
+  }
+
+  // おてがるカードを方法名で探す。完全一致が基本。宅急便だけは
+  // 「宅急便60〜160サイズ」のようにサイズ接尾辞付きのタイトルで
+  // カードが分かれている（実測 2026-11-26）ため、名称＋サイズ接尾辞
+  // のみのタイトルも一致とみなす（有効なカードを優先）。
+  function findOfficialCard(cards, name) {
+    const norm = (s) =>
+      String(s || "").replace(/[\s　]/g, "").replace(/（EAZY）|\(EAZY\)/gi, "");
+    const t = norm(name);
+    const exact = cards.find((c) => c.titles.includes(t));
+    if (exact) return exact;
+    return (
+      cards.find(
+        (c) =>
+          !c.box.disabled &&
+          c.titles.some(
+            (title) =>
+              title.startsWith(t) && /^\d+〜\d+サイズ$/.test(title.slice(t.length))
+          )
+      ) || null
+    );
+  }
+
+  // 「その他の配送方法」の i 番目の「見えている」ブロックを返す。
+  // 実測 2026-11-26（ユーザーのコンソール実行で判明）: ブロックは
+  // 最初から 10 個（shipping_other_check1..10）DOM にあるが非表示で、
+  // 「追加する」(<span id="auc_add_shipform">) が次の 1 個を表示する。
+  // 非表示ブロックは操作対象にしない（隠れたままでは有効化されない）。
+  async function ensurePlainBlock(otherArea, i) {
+    if (!otherArea) return null;
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const visibleBlocks = () =>
+      Array.from(otherArea.querySelectorAll("li.CheckExpand__item")).filter(
+        (li) => li.getClientRects().length > 0
+      );
+    let block = visibleBlocks()[i];
+    if (block) return block;
+    const addBtn =
+      document.getElementById("auc_add_shipform") ||
+      Array.from(
+        otherArea.querySelectorAll("button, a, input[type='button'], div, span")
+      )
+        .filter((el) => {
+          const t = (el.textContent || el.value || "").replace(/\s+/g, "");
+          return t === "追加する";
+        })
+        .sort(
+          (a, b) =>
+            a.querySelectorAll("*").length - b.querySelectorAll("*").length
+        )[0];
+    if (!addBtn) return null;
+    try { addBtn.click(); } catch (e) { /* noop */ }
+    for (let w = 0; w < 8 && !block; w++) {
+      await sleep(500);
+      block = visibleBlocks()[i];
+    }
+    if (!block) {
+      FF.clickLikeUser(addBtn);
+      for (let w = 0; w < 8 && !block; w++) {
+        await sleep(500);
+        block = visibleBlocks()[i];
+      }
+    }
+    return block || null;
+  }
+
+  // 現在のフォームの配送方法の状態が、コピー元の list と一致するか。
+  // カテゴリ選択ページへの遷移・復帰でチェック状態が消えることがある
+  // ため（実測 2026-11-26）、復帰後の照合に使う。
+  function verifyShipState(list) {
+    const norm = (s) =>
+      String(s || "").replace(/[\s　]/g, "").replace(/（EAZY）|\(EAZY\)/gi, "");
+    const cards = collectMemberCards();
+    const otherArea = document.querySelector("#other_ship_method_area");
+    if (cards.length) {
+      const keep = new Set();
+      for (const m of list) {
+        if (!m.official) continue;
+        const card = findOfficialCard(cards, m.name);
+        if (!card || !card.box.checked) return false;
+        keep.add(card.box);
+      }
+      const plainList = list.filter((m) => !m.official);
+      const blocks = otherArea
+        ? Array.from(otherArea.querySelectorAll("li.CheckExpand__item"))
+        : [];
+      for (let i = 0; i < plainList.length; i++) {
+        const block = blocks[i];
+        const check = block ? block.querySelector('input[type="checkbox"]') : null;
+        const sel = block ? block.querySelector('select[name="shipmethod"]') : null;
+        if (!check || !check.checked || !sel || sel.selectedIndex < 0) return false;
+        if (
+          !norm(sel.options[sel.selectedIndex].textContent || "").includes(
+            norm(plainList[i].name)
+          )
+        ) {
+          return false;
+        }
+        keep.add(check);
+      }
+      const areaBoxes = [
+        ...cards.map((c) => c.box),
+        ...(otherArea
+          ? Array.from(otherArea.querySelectorAll('input[type="checkbox"]'))
+          : []),
+      ];
+      return areaBoxes.every((b) => keep.has(b) || b.disabled || !b.checked);
+    }
+    // radio フォーム: 先頭の方法の radio がチェック済みか。
+    // official フラグがある場合は、同名でも別サービス（おてがる
+    // カード vs その他 radio）を取り違えないよう片方だけを見る。
+    const target = norm(list[0].name);
+    const official = list[0].official;
+    if (official !== true) {
+      const byName = Array.from(
+        document.querySelectorAll('input[type="radio"][name="shipmethod_dummy"]')
+      ).find((r) => norm(r.getAttribute("data-deliveryname") || "") === target);
+      if (byName) return byName.checked;
+      if (official === false) {
+        const scope = document.querySelector("#other_ship_method_area");
+        if (scope) {
+          for (const r of scope.querySelectorAll('input[type="radio"]')) {
+            const row = r.closest("label") || r.parentElement;
+            if (norm(row ? row.textContent || "" : "") === target) return r.checked;
+          }
+        }
+        return false;
+      }
+    }
+    for (const label of document.querySelectorAll(
+      "label.js-ship-label, label.OfficialDelivery__item"
+    )) {
+      const titles = Array.from(
+        label.querySelectorAll(".OfficialDelivery__itemTitle")
+      ).map((el) => norm(el.textContent || ""));
+      if (titles.includes(target)) {
+        const radio = label.querySelector('input[type="radio"]');
+        return !!(radio && radio.checked);
+      }
+    }
+    return false;
+  }
+
   // 複数の配送方法（コピー元「配送方法の詳細」の一覧）をフォームへ反映する。
   // list は [{ name: 接頭辞なし名称, official: bool }]。
   // 会員フォーム（checkbox）: おてがるカードは全部チェック、その他
@@ -986,20 +1205,16 @@
   async function selectShipMethods(list) {
     const norm = (s) =>
       String(s || "").replace(/[\s　]/g, "").replace(/（EAZY）|\(EAZY\)/gi, "");
-    const memberCards = () =>
-      Array.from(document.querySelectorAll("label.OfficialDelivery__item"))
-        .filter((el) => FF.isVisible(el))
-        .map((label) => ({
-          label,
-          box: label.querySelector('input[type="checkbox"]'),
-          titles: Array.from(
-            label.querySelectorAll(".OfficialDelivery__itemTitle")
-          ).map((el) => norm(el.textContent || "")),
-        }))
-        .filter((c) => c.box);
-    if (!memberCards().length) {
+    if (!collectMemberCards().length) {
       const first = list[0];
-      const r = await selectShipMethod(first.name);
+      const r = await selectShipMethod(first.name, {
+        prefer:
+          first.official === true
+            ? "card"
+            : first.official === false
+              ? "other"
+              : null,
+      });
       const rest = list
         .slice(1)
         .map((m) => (m.official ? "おてがる配送" : "") + m.name);
@@ -1019,45 +1234,45 @@
     const toggleBox = async (box, want) => {
       if (box.disabled || box.checked === want) return box.checked === want;
       try { box.click(); } catch (e) { /* noop */ }
+      await sleep(600);
       if (box.checked !== want) {
         const l = box.closest("label");
         if (l) { try { l.click(); } catch (e) { /* noop */ } }
+        await sleep(600);
       }
-      await sleep(250);
       return box.checked === want;
     };
     const keep = new Set();
     const applied = [];
     const missed = [];
-    const cards = memberCards();
+    const cards = collectMemberCards();
     for (const m of list) {
       if (!m.official) continue;
-      const card = cards.find((c) => c.titles.includes(norm(m.name)));
+      const card = findOfficialCard(cards, m.name);
       if (card && (await toggleBox(card.box, true))) {
         keep.add(card.box);
         applied.push("おてがる配送" + m.name);
       } else {
-        missed.push("おてがる配送" + m.name);
+        missed.push(
+          "おてがる配送" + m.name +
+          "（カード候補：" +
+          cards.flatMap((c) => c.titles).join("/") +
+          "）"
+        );
       }
     }
     const plainList = list.filter((m) => !m.official);
+    // 非表示の予備ブロック（10 個常駐）を数えないよう、見えている
+    // ブロックだけを対象にする。
     const plainBlocks = () =>
       otherArea
-        ? Array.from(otherArea.querySelectorAll("li.CheckExpand__item"))
+        ? Array.from(otherArea.querySelectorAll("li.CheckExpand__item")).filter(
+            (li) => li.getClientRects().length > 0
+          )
         : [];
     for (let i = 0; i < plainList.length; i++) {
       const m = plainList[i];
-      let block = plainBlocks()[i];
-      if (!block && otherArea) {
-        const addBtn = Array.from(
-          otherArea.querySelectorAll("button, a, input[type='button']")
-        ).find((el) => norm(el.textContent || el.value || "") === "追加する");
-        if (addBtn) {
-          try { addBtn.click(); } catch (e) { /* noop */ }
-          await sleep(900);
-          block = plainBlocks()[i];
-        }
-      }
+      const block = await ensurePlainBlock(otherArea, i);
       const check = block ? block.querySelector('input[type="checkbox"]') : null;
       const sel = block ? block.querySelector('select[name="shipmethod"]') : null;
       if (!check || !sel) { missed.push(m.name); continue; }
@@ -1564,6 +1779,15 @@
           [CATEGORY_PENDING_KEY]: {
             segments: pendingCategoryNav.segments,
             path: data.categoryText,
+            // 復帰後の配送方法の再適用に使うため、入力時点で使った
+            // 配送リストを保留データにも持たせる（復帰時にコピーデータを
+            // 読み直すと単一方法に化けることがあったため、こちらを正とする）。
+            shipList:
+              data.shippingMethods && data.shippingMethods.length
+                ? data.shippingMethods
+                : data.shippingMethod
+                  ? [{ name: data.shippingMethod, official: null }]
+                  : null,
             at: Date.now(),
           },
         });
@@ -1603,6 +1827,79 @@
         if (catInput && catInput.value && catInput.value !== "0" && shown.includes(leaf)) {
           try { await chrome.storage.local.remove(CATEGORY_PENDING_KEY); } catch (e) { /* noop */ }
           FC.ui.showToast("カテゴリを自動選択しました：" + (pending.path || shown));
+          // 配送方法の再確認: カテゴリ選択ページへの遷移・復帰で配送方法の
+          // チェック状態がリセットされることがある（実測 2026-11-26:
+          // パネルは OK でも復帰後のフォームは未選択だった）。コピーデータと
+          // 現在の状態を照合し、消えていたらもう一度だけ適用する。
+          let shipFix = null;
+          try {
+            // 配送リストは保留データ（入力時点で保存したもの）を正とし、
+            // 無い場合だけコピーデータを読み直す。
+            let list =
+              pending.shipList && pending.shipList.length ? pending.shipList : null;
+            if (!list) {
+              const d = await FC.load();
+              if (
+                d &&
+                d.source === "yahoo" &&
+                (d.shippingMethod || (d.shippingMethods && d.shippingMethods.length))
+              ) {
+                list =
+                  d.shippingMethods && d.shippingMethods.length
+                    ? d.shippingMethods
+                    : [{ name: d.shippingMethod, official: null }];
+              }
+            }
+            if (list) {
+              // 配送セクションの描画を待ってから照合する（復帰直後は
+              // カードがまだ描画されておらず空振りすることがある）。
+              for (let w = 0; w < 12; w++) {
+                if (
+                  collectMemberCards().length ||
+                  document.querySelector('input[name="shipmethod_dummy"]')
+                ) {
+                  break;
+                }
+                await new Promise((r) => setTimeout(r, 500));
+              }
+              // Yahoo の下書き復元は遅れて完了することがある（実測
+              // 2026-11-26: 「その他」ブロックが判定の直後に戻ってきた）。
+              // 最大 3 秒だけ待って状態が揃えば再適用は不要（ユーザーの
+              // 指定 2026-11-26: 待ちは 3 秒で十分）。
+              for (let w = 0; w < 6 && !verifyShipState(list); w++) {
+                await new Promise((r) => setTimeout(r, 500));
+              }
+              if (!verifyShipState(list)) {
+                const res =
+                  list.length > 1 || list[0].official != null
+                    ? await selectShipMethods(list)
+                    : await selectShipMethod(list[0].name, {
+                        prefer:
+                          list[0].official === true
+                            ? "card"
+                            : list[0].official === false
+                              ? "other"
+                              : null,
+                      });
+                shipFix = {
+                  status: res.ok ? "ok" : "fail",
+                  note:
+                    (res.note ||
+                      (res.ok
+                        ? list
+                            .map((m) => (m.official ? "おてがる配送" : "") + m.name)
+                            .join("＋")
+                        : "自動選択できませんでした（候補：" +
+                          list[0].name +
+                          "） " +
+                          (res.diag || ""))) +
+                    "（カテゴリ復帰後に再適用・" +
+                    list.length +
+                    "件）",
+                };
+              }
+            }
+          } catch (e) { /* noop */ }
           // 結果パネルはカテゴリ選択ページへの遷移で DOM ごと消えてしまう
           // （表示されるのは遷移前の 1 秒弱だけ）。戻ってきたら、保存済みの
           // レポートのカテゴリ行を OK に差し替えてパネルを再表示する。
@@ -1610,11 +1907,15 @@
             const repRes = await chrome.storage.local.get("lastFillReport");
             const rep = repRes.lastFillReport;
             if (rep && Array.isArray(rep.lines)) {
-              const lines = rep.lines.map((l) =>
-                l.label === "カテゴリ"
-                  ? { label: l.label, status: "ok", note: pending.path || shown }
-                  : l
-              );
+              const lines = rep.lines.map((l) => {
+                if (l.label === "カテゴリ") {
+                  return { label: l.label, status: "ok", note: pending.path || shown };
+                }
+                if (l.label === "配送方法" && shipFix) {
+                  return { label: l.label, status: shipFix.status, note: shipFix.note };
+                }
+                return l;
+              });
               FF.showPanel(
                 rep.title || "Yahoo!オークション 出品フォーム入力結果",
                 lines
