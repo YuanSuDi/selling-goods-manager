@@ -2773,7 +2773,14 @@ async function getYahooAuctionTitle(tabId, itemId) {
   }
 }
 
-async function processYahooRelistItem(tabId, item) {
+async function processYahooRelistItem(tabId, item, opts) {
+  // opts.skipListVerify: 落札者なし一括再出品専用（ユーザー指定 2026-11-26）。
+  // 無落札の再出品は同一 ID で再開されることが実地検証済みで、完了ページ
+  // （出品手続きが完了しました）自体が Yahoo の受付確認になるため、
+  // 出品中一覧の走査確認を省略し、同じ ID のまま成功として返す。
+  // 管理タスク経由（落札あり→新 ID の可能性がある）は従来どおり一覧で
+  // 新 ID を特定する（記録の listing_id を付け替える必要があるため）。
+  const skipListVerify = !!(opts && opts.skipListVerify);
   const url =
     "https://auctions.yahoo.co.jp/sell/jp/show/resubmit?aID=" +
     encodeURIComponent(item.id);
@@ -2825,6 +2832,10 @@ async function processYahooRelistItem(tabId, item) {
       return { success: true, listingId: page.listingId };
     }
     if (page.status === "success" || page.status === "verify") {
+      if (skipListVerify) {
+        // 落札者なし再出品: 完了ページ到達 = 成功。同一 ID で再開される。
+        return { success: true, listingId: item.id };
+      }
       // Yahoo の再出品は新しいオークション ID で公開される。タイトルで
       // 出品中一覧を引き、新しい ID を特定して返す。旧 ID のまま結果を
       // 返すと、管理側のレコードが終了済み ID を指し続けて販売照合が壊れる。
@@ -2894,7 +2905,7 @@ async function runYahooRelist(tabId, requestedIds, run) {
         currentId: item.id,
         message: "処理中 " + (index + 1) + "/" + items.length + "：" + item.title,
       });
-      await processYahooRelistItem(workTabId, item);
+      await processYahooRelistItem(workTabId, item, { skipListVerify: true });
       completed++;
       run.currentId = null;
       await setYahooRelistState({
