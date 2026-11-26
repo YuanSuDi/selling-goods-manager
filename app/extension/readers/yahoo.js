@@ -329,6 +329,88 @@
     };
   }
 
+  // 「配送方法の詳細」ポップアップを開き、提供される配送方法を全部読む
+  // （2026-11-26 ユーザー承認）。ポップアップが権威。おてがる配送の
+  // 接頭辞の有無でフォーム側の対応先が変わる（おてがるカード / その他
+  // select）ため、{ name: 接頭辞なし名称, official: bool } で返す。
+  // 読めなければ null（従来の単一読みに委ねる）。コピーを止めない。
+  async function readShippingMethodsFromPopup() {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    // position:fixed のモーダルは offsetParent が null になるため使わない。
+    const isVis = (el) => {
+      const r = el.getBoundingClientRect();
+      const st = getComputedStyle(el);
+      return (
+        r.width > 0 && r.height > 0 && st.display !== "none" && st.visibility !== "hidden"
+      );
+    };
+    try {
+      const trigger = Array.from(
+        document.querySelectorAll("a, button, span, div, li")
+      ).find((el) => {
+        if (!isVis(el)) return false;
+        const t = (el.textContent || "").replace(/\s+/g, "").trim();
+        return t === "配送方法の詳細";
+      });
+      if (!trigger) return null;
+      trigger.click();
+      let popup = null;
+      for (let i = 0; i < 20 && !popup; i++) {
+        await sleep(250);
+        const cands = Array.from(document.querySelectorAll("div, section, table"))
+          .filter((el) => {
+            if (!isVis(el)) return false;
+            const t = el.textContent || "";
+            return t.includes("配送方法と送料") && t.length < 4000;
+          })
+          .sort(
+            (a, b) =>
+              (a.textContent || "").length - (b.textContent || "").length
+          );
+        popup = cands[0] || null;
+      }
+      if (!popup) return null;
+      const els = Array.from(
+        popup.querySelectorAll("th, td, dt, dd, li, div, p, span")
+      );
+      const byKey = new Map();
+      els.forEach((el, idx) => {
+        const raw = (el.textContent || "").replace(/\s+/g, " ").trim();
+        if (!raw || raw.length > 60) return;
+        let official = false;
+        let rest = raw;
+        if (rest.startsWith("おてがる配送")) {
+          official = true;
+          rest = rest.slice("おてがる配送".length).trim();
+        }
+        const name = SHIP_METHOD_NAMES.find(
+          (n) => rest === n || (rest.startsWith(n) && rest.length - n.length <= 30)
+        );
+        if (!name) return;
+        const key = (official ? "o:" : "p:") + name;
+        const prev = byKey.get(key);
+        if (!prev || raw.length < prev.len) {
+          byKey.set(key, { name, official, len: raw.length, idx });
+        }
+      });
+      const methods = Array.from(byKey.values())
+        .sort((a, b) => a.idx - b.idx)
+        .map((m) => ({ name: m.name, official: m.official }));
+      const closeBtn = Array.from(
+        popup.querySelectorAll("a, button, span, div")
+      ).find(
+        (el) => (el.textContent || "").replace(/\s+/g, "").trim() === "閉じる"
+      );
+      if (closeBtn) {
+        try { closeBtn.click(); } catch (e) { /* 閉じられなくても致命ではない */ }
+      }
+      return methods.length ? methods : null;
+    } catch (e) {
+      console.warn("[FurimaCopy] shipping popup read failed", e);
+      return null;
+    }
+  }
+
   async function handleCopy() {
     let jsonData = null;
     try {
@@ -356,6 +438,18 @@
       if (cleanHtml) data.descriptionHtml = cleanHtml;
     }
     if (state.shipMethod) data.shippingMethod = state.shipMethod;
+    // 配送方法の詳細ポップアップが読めれば、それが権威（複数方法と
+    // おてがる接頭辞の区別を含む）。shippingMethod には先頭を入れ、
+    // 従来の単一選択経路との互換を保つ。
+    try {
+      const popupMethods = await readShippingMethodsFromPopup();
+      if (popupMethods && popupMethods.length) {
+        data.shippingMethods = popupMethods;
+        data.shippingMethod = popupMethods[0].name;
+      }
+    } catch (e) {
+      console.warn("[FurimaCopy] shipping popup read failed", e);
+    }
     if (state.categoryPath) data.categoryText = state.categoryPath;
     // 価格は状態 JSON を正とする: 開始価格は initPrice（入札があると
     // DOM の現在価格とずれる）。開始価格より高い winPrice がある場合だけ

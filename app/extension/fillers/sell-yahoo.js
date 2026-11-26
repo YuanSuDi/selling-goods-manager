@@ -976,6 +976,140 @@
     return done(false);
   }
 
+  // 複数の配送方法（コピー元「配送方法の詳細」の一覧）をフォームへ反映する。
+  // list は [{ name: 接頭辞なし名称, official: bool }]。
+  // 会員フォーム（checkbox）: おてがるカードは全部チェック、その他
+  // select はブロックを「追加する」で増やしながら全部入れ、対象外の
+  // チェックを外し、最終状態がコピー元と一致するか検証する。
+  // 非会員フォーム（radio）: 単一選択しかできないため先頭だけ従来経路で
+  // 入れ、残りは note で知らせる。
+  async function selectShipMethods(list) {
+    const norm = (s) =>
+      String(s || "").replace(/[\s　]/g, "").replace(/（EAZY）|\(EAZY\)/gi, "");
+    const memberCards = () =>
+      Array.from(document.querySelectorAll("label.OfficialDelivery__item"))
+        .filter((el) => FF.isVisible(el))
+        .map((label) => ({
+          label,
+          box: label.querySelector('input[type="checkbox"]'),
+          titles: Array.from(
+            label.querySelectorAll(".OfficialDelivery__itemTitle")
+          ).map((el) => norm(el.textContent || "")),
+        }))
+        .filter((c) => c.box);
+    if (!memberCards().length) {
+      const first = list[0];
+      const r = await selectShipMethod(first.name);
+      const rest = list
+        .slice(1)
+        .map((m) => (m.official ? "おてがる配送" : "") + m.name);
+      return {
+        ok: r.ok,
+        diag: r.diag,
+        note: r.ok
+          ? first.name +
+            (rest.length
+              ? "（他" + rest.length + "件は単一選択のため未反映：" + rest.join("、") + "）"
+              : "")
+          : "自動選択できませんでした（候補：" + first.name + "） " + r.diag,
+      };
+    }
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const otherArea = document.querySelector("#other_ship_method_area");
+    const toggleBox = async (box, want) => {
+      if (box.disabled || box.checked === want) return box.checked === want;
+      try { box.click(); } catch (e) { /* noop */ }
+      if (box.checked !== want) {
+        const l = box.closest("label");
+        if (l) { try { l.click(); } catch (e) { /* noop */ } }
+      }
+      await sleep(250);
+      return box.checked === want;
+    };
+    const keep = new Set();
+    const applied = [];
+    const missed = [];
+    const cards = memberCards();
+    for (const m of list) {
+      if (!m.official) continue;
+      const card = cards.find((c) => c.titles.includes(norm(m.name)));
+      if (card && (await toggleBox(card.box, true))) {
+        keep.add(card.box);
+        applied.push("おてがる配送" + m.name);
+      } else {
+        missed.push("おてがる配送" + m.name);
+      }
+    }
+    const plainList = list.filter((m) => !m.official);
+    const plainBlocks = () =>
+      otherArea
+        ? Array.from(otherArea.querySelectorAll("li.CheckExpand__item"))
+        : [];
+    for (let i = 0; i < plainList.length; i++) {
+      const m = plainList[i];
+      let block = plainBlocks()[i];
+      if (!block && otherArea) {
+        const addBtn = Array.from(
+          otherArea.querySelectorAll("button, a, input[type='button']")
+        ).find((el) => norm(el.textContent || el.value || "") === "追加する");
+        if (addBtn) {
+          try { addBtn.click(); } catch (e) { /* noop */ }
+          await sleep(900);
+          block = plainBlocks()[i];
+        }
+      }
+      const check = block ? block.querySelector('input[type="checkbox"]') : null;
+      const sel = block ? block.querySelector('select[name="shipmethod"]') : null;
+      if (!check || !sel) { missed.push(m.name); continue; }
+      if (!(await toggleBox(check, true))) { missed.push(m.name); continue; }
+      const enabled = await FF.waitFor(
+        () => (!sel.disabled ? true : null),
+        3000,
+        200
+      ).catch(() => null);
+      if (!enabled || !FF.trySelectByText(sel, [m.name])) {
+        missed.push(m.name);
+        continue;
+      }
+      keep.add(check);
+      applied.push(m.name);
+    }
+    const areaBoxes = [
+      ...cards.map((c) => c.box),
+      ...(otherArea
+        ? Array.from(otherArea.querySelectorAll('input[type="checkbox"]'))
+        : []),
+    ];
+    for (const b of areaBoxes) {
+      if (keep.has(b) || b.disabled || !b.checked) continue;
+      await toggleBox(b, false);
+    }
+    await sleep(400);
+    const verifyOk =
+      Array.from(keep).every((b) => b.checked) &&
+      areaBoxes.every((b) => keep.has(b) || b.disabled || !b.checked) &&
+      plainList.every((m, i) => {
+        const block = plainBlocks()[i];
+        const sel = block ? block.querySelector('select[name="shipmethod"]') : null;
+        if (!sel || sel.selectedIndex < 0) return false;
+        return norm(sel.options[sel.selectedIndex].textContent || "").includes(
+          norm(m.name)
+        );
+      });
+    const ok = missed.length === 0 && verifyOk;
+    return {
+      ok,
+      diag: "member-multi applied=" + applied.length + " missed=" + missed.length,
+      note: ok
+        ? applied.join("＋")
+        : "一部反映できませんでした（反映：" +
+          (applied.join("＋") || "なし") +
+          " / 未反映：" +
+          (missed.join("、") || "検証NG") +
+          "）",
+    };
+  }
+
   // 編集欄に実際に入った説明テキストを読み戻す（入力検証用）。
   function readBackDescriptionText() {
     const frames = Array.from(document.querySelectorAll("iframe"));
@@ -1265,18 +1399,35 @@
     let shipHandled = false;
     if (
       data.source === "yahoo" &&
-      (data.shippingMethod || data.shippingBurden || data.shipFrom || data.shipDays)
+      (data.shippingMethod ||
+        (data.shippingMethods && data.shippingMethods.length) ||
+        data.shippingBurden ||
+        data.shipFrom ||
+        data.shipDays)
     ) {
-      if (data.shippingMethod) {
+      if (data.shippingMethod || (data.shippingMethods && data.shippingMethods.length)) {
         shipHandled = true;
-        const shipRes = await selectShipMethod(data.shippingMethod);
-        lines.push({
-          label: "配送方法",
-          status: shipRes.ok ? "ok" : "fail",
-          note: shipRes.ok
-            ? data.shippingMethod
-            : "自動選択できませんでした（候補： " + data.shippingMethod + "） " + shipRes.diag,
-        });
+        const list =
+          data.shippingMethods && data.shippingMethods.length
+            ? data.shippingMethods
+            : [{ name: data.shippingMethod, official: null }];
+        if (list.length > 1 || list[0].official != null) {
+          const shipRes = await selectShipMethods(list);
+          lines.push({
+            label: "配送方法",
+            status: shipRes.ok ? "ok" : "fail",
+            note: shipRes.note,
+          });
+        } else {
+          const shipRes = await selectShipMethod(data.shippingMethod);
+          lines.push({
+            label: "配送方法",
+            status: shipRes.ok ? "ok" : "fail",
+            note: shipRes.ok
+              ? data.shippingMethod
+              : "自動選択できませんでした（候補： " + data.shippingMethod + "） " + shipRes.diag,
+          });
+        }
       }
       if (data.shippingBurden) {
         shipHandled = true;
