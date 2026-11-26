@@ -748,6 +748,113 @@
       diag.strat.push("expand:" + (ok ? "ok" : "empty"));
       return !!ok;
     };
+    // 会員フォームルート（実 DOM 2026-11-26、ユーザーが DevTools で提示）:
+    // おてがる配送は radio ではなく checkbox のカード:
+    // <label class="OfficialDelivery__item js-deliveryItemForm"> の中に
+    // <input type="checkbox" id="ship_delivery_N" value="yes"
+    //  class="OfficialDelivery__checkBox js-ListingSwitchItem"
+    //  data-deliveryid="114"> と .OfficialDelivery__itemTitle。
+    // フォーム既定で宅急便（EAZY）がチェック済みのため、対象を入れて
+    // から他のチェックを全部外し、「対象だけチェック済み」を検証する。
+    // その他の配送方法は #other_ship_method_area の
+    // <input type="checkbox" id="shipping_other_check1"> を先にチェック
+    // すると <select name="shipmethod"> が有効化される構造。
+    // checkbox が 1 つも無いフォーム（非会員）では null を返し、
+    // 従来の radio ルートに委ねる。
+    const memberRoute = async () => {
+      const cardOf = (box) => box.closest("label") || box.parentElement;
+      const officialBoxes = Array.from(
+        document.querySelectorAll("label.OfficialDelivery__item")
+      )
+        .filter((el) => FF.isVisible(el))
+        .map((label) => ({
+          label,
+          box: label.querySelector('input[type="checkbox"]'),
+          titles: Array.from(
+            label.querySelectorAll(".OfficialDelivery__itemTitle")
+          ).map((el) => norm(el.textContent || "")),
+        }))
+        .filter((c) => c.box);
+      if (!officialBoxes.length) return null;
+      const otherArea = document.querySelector("#other_ship_method_area");
+      const otherBoxes = otherArea
+        ? Array.from(otherArea.querySelectorAll('input[type="checkbox"]'))
+        : [];
+      const areaBoxes = [
+        ...officialBoxes.map((c) => c.box),
+        ...otherBoxes,
+      ];
+      const toggleBox = async (box, want) => {
+        if (box.disabled || box.checked === want) return box.checked === want;
+        try { box.click(); } catch (e) { /* noop */ }
+        if (box.checked !== want) {
+          const l = cardOf(box);
+          if (l) { try { l.click(); } catch (e) { /* noop */ } }
+        }
+        await new Promise((r) => setTimeout(r, 250));
+        return box.checked === want;
+      };
+      const uncheckOthers = async (keep) => {
+        for (const b of areaBoxes) {
+          if (b === keep || b.disabled || !b.checked) continue;
+          await toggleBox(b, false);
+          diag.strat.push("uncheck:" + (b.id || "?") + (b.checked ? ":still" : ":off"));
+        }
+      };
+      const othersCleared = (keep) =>
+        areaBoxes.every((b) => b === keep || b.disabled || !b.checked);
+
+      const hit = officialBoxes.find((c) => c.titles.includes(target));
+      if (hit) {
+        diag.tier = "member-card";
+        diag.radio =
+          "name=" + (hit.box.name || "-") + " id=" + (hit.box.id || "-") +
+          " deliveryid=" + (hit.box.getAttribute("data-deliveryid") || "-");
+        if (!(await toggleBox(hit.box, true))) return false;
+        await uncheckOthers(hit.box);
+        await new Promise((r) => setTimeout(r, 400));
+        return hit.box.checked && othersCleared(hit.box);
+      }
+      // その他（CheckExpand + select）ルート
+      const block = otherArea
+        ? otherArea.querySelector("li.CheckExpand__item") || otherArea
+        : null;
+      const otherCheck = block
+        ? block.querySelector('input[type="checkbox"]')
+        : null;
+      const otherSel = block ? block.querySelector('select[name="shipmethod"]') : null;
+      if (otherCheck && otherSel) {
+        diag.tier = "member-other";
+        if (!(await toggleBox(otherCheck, true))) return false;
+        const enabled = await FF.waitFor(
+          () => (!otherSel.disabled ? true : null),
+          3000,
+          200
+        ).catch(() => null);
+        if (!enabled) { diag.strat.push("other:still-disabled"); return false; }
+        if (!FF.trySelectByText(otherSel, [method, target])) {
+          diag.strat.push("other:select-fail");
+          return false;
+        }
+        await uncheckOthers(otherCheck);
+        await new Promise((r) => setTimeout(r, 400));
+        const selOpt =
+          otherSel.selectedIndex >= 0
+            ? otherSel.options[otherSel.selectedIndex]
+            : null;
+        return (
+          otherCheck.checked &&
+          !!selOpt &&
+          norm(selOpt.textContent || "") === target &&
+          othersCleared(otherCheck)
+        );
+      }
+      diag.tier = "member-none";
+      return false;
+    };
+    const memberResult = await memberRoute();
+    if (memberResult !== null) return done(memberResult);
+
     let dRadio = findByDeliveryName();
     if (dRadio && !FF.isVisible(dRadio)) {
       await ensureOtherExpanded();
@@ -1173,10 +1280,23 @@
       }
       if (data.shippingBurden) {
         shipHandled = true;
-        const radio = document.querySelector(
-          'input[type="radio"][name="shipping_dummy"][value="' + data.shippingBurden + '"]'
-        );
         let ok = false;
+        // 会員フォームでは送料負担が <select>（選択肢は出品者/落札者）。
+        // その select があれば先にそちらで合わせる。無ければ従来の
+        // radio（name="shipping_dummy"）ルート（非会員フォーム）。
+        const burdenText = data.shippingBurden === "seller" ? "出品者" : "落札者";
+        const burdenSel = Array.from(document.querySelectorAll("select")).find((s) => {
+          const texts = Array.from(s.options).map((o) => (o.textContent || "").trim());
+          return texts.includes("出品者") && texts.includes("落札者");
+        });
+        if (burdenSel) {
+          ok = FF.trySelectByText(burdenSel, [burdenText]);
+        }
+        const radio = ok
+          ? null
+          : document.querySelector(
+              'input[type="radio"][name="shipping_dummy"][value="' + data.shippingBurden + '"]'
+            );
         if (radio) {
           FF.clickLikeUser(radio.closest("label") || radio);
           if (!radio.checked) {
