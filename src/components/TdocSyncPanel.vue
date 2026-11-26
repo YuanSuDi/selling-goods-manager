@@ -10,7 +10,10 @@ import {
   tdocImportAll,
   tdocPush,
   tdocResolve,
+  urlClick,
 } from '../store'
+
+const TOKEN_PAGE_URL = 'https://docs.qq.com/open/auth/mcp.html'
 
 const settings = computed(() => (tdocState.value && tdocState.value.settings) || null)
 const lastRun = computed(() => (tdocState.value && tdocState.value.lastRun) || null)
@@ -115,11 +118,19 @@ const pushTargetFor = (id) => {
       <div class="tdoc-card-title">连接设置</div>
       <div class="tdoc-form">
         <label>腾讯文档 Token</label>
-        <a-input-password
-          v-model:value="tokenInput"
-          :placeholder="settings && settings.tokenSet ? '已设置（留空表示不修改）' : '粘贴腾讯文档 MCP Token'"
-          style="max-width: 460px"
-        />
+        <span>
+          <a-input-password
+            v-model:value="tokenInput"
+            :placeholder="settings && settings.tokenSet ? '已设置（留空表示不修改）' : '粘贴腾讯文档 MCP Token'"
+            style="max-width: 460px"
+          />
+          <a style="margin-left: 10px" @click.prevent="urlClick(TOKEN_PAGE_URL)">
+            去腾讯文档获取 Token →
+          </a>
+          <div class="tdoc-hint" style="margin-left: 0; margin-top: 2px">
+            打开后用文档所属的账号登录腾讯文档，在页面里生成 MCP Token 再粘贴回来。
+          </div>
+        </span>
         <label>文档 ID</label>
         <span>
           <a-input
