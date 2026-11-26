@@ -230,16 +230,26 @@
     if (!selectEl || selectEl.tagName !== "SELECT") return false;
     const cands = (candidateTexts || []).map(normalizeText).filter(Boolean);
     if (!cands.length) return false;
-    for (const opt of Array.from(selectEl.options)) {
-      if (!opt.value) continue; // 「選択してください」等のプレースホルダは飛ばす
-      const ot = normalizeText(opt.textContent);
-      if (!ot) continue;
-      for (const c of cands) {
-        if (ot === c || ot.includes(c) || c.includes(ot)) {
-          setNativeValue(selectEl, opt.value);
-          console.log(LOG, "trySelectByText matched:", opt.textContent, "in", selectEl);
-          return true;
-        }
+    const opts = Array.from(selectEl.options)
+      .filter((opt) => opt.value) // 「選択してください」等のプレースホルダは飛ばす
+      .map((opt) => ({ opt, ot: normalizeText(opt.textContent) }))
+      .filter((x) => x.ot);
+    // 第 1 パス: 完全一致を全候補・全選択肢で最優先する。
+    // 包含一致を先にやると、候補「未使用に近い」に対して先頭の選択肢
+    // 「未使用」が部分一致で誤爆する（2026-11-26 実バグ）。
+    for (const { opt, ot } of opts) {
+      if (cands.some((c) => ot === c)) {
+        setNativeValue(selectEl, opt.value);
+        console.log(LOG, "trySelectByText matched (exact):", opt.textContent, "in", selectEl);
+        return true;
+      }
+    }
+    // 第 2 パス: 表記ゆれ吸収のための包含一致（クロスプラットフォーム用）。
+    for (const { opt, ot } of opts) {
+      if (cands.some((c) => ot.includes(c) || c.includes(ot))) {
+        setNativeValue(selectEl, opt.value);
+        console.log(LOG, "trySelectByText matched (partial):", opt.textContent, "in", selectEl);
+        return true;
       }
     }
     console.log(LOG, "trySelectByText: no option matched", candidateTexts);
