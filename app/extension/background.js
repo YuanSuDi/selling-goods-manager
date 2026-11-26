@@ -2727,28 +2727,110 @@ function titlesMatch(a, b) {
   return shorter.length >= 12 && longer.startsWith(shorter);
 }
 
-// 再出品で公開された現在の出品 ID を特定する。Yahoo の再出品は新しい
-// オークション ID が発行されるため、旧 ID は一覧に現れない。タイトルが
-// 一意に一致する出品を新しい ID とみなす（曖昧な場合は null = 失敗）。
-// 一覧への反映遅延に備えて数ラウンド待つ。
+// 再出品で公開された現在の出品 ID を特定する（ユーザー指定の手順
+// 2026-11-26）: 一覧は残り時間の長い順で開き、出品したばかりの商品が
+// 来るはずの 1 ページ目を最大 3 回まで再読み込みして探す。それでも
+// 見つからなければ 2 ページ目以降を最大 10 ページまでめくり、
+// それでも見つからなければ null（呼び出し側でエラーにする）。
+// 旧 ID が見つかればその時点で確定。新 ID はタイトルが一意に一致する
+// 出品とみなす（同名出品の取り違えを避けるため、全ページ見てから判定）。
 async function resolveYahooRelistedId(tabId, oldId, title) {
-  for (let round = 0; round < 8; round++) {
-    // 同一 ID で再開された場合は最初のページで見つかるので早期終了する。
-    // 新 ID のタイトル照合は同名出品との取り違えを避けるため全ページ走査が要る。
-    const entries = await scanSellingListEntries(
-      tabId,
-      (list) => list.some((e) => e.id === oldId)
-    );
-    if (entries) {
-      if (entries.some((e) => e.id === oldId)) return oldId;
-      if (title) {
-        const matches = entries.filter(
-          (e) => e.id !== oldId && titlesMatch(e.title, title)
-        );
-        if (matches.length === 1) return matches[0].id;
+  const byId = new Map();
+  const merge = (entries) => {
+    for (const e of entries) {
+      const prev = byId.get(e.id);
+      if (!prev || (e.title && e.title.length > (prev.title || "").length)) {
+        byId.set(e.id, e);
       }
     }
-    await remoteSleep(8000);
+  };
+  const extractPage = async () => {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const links = Array.from(document.querySelectorAll("a[href]"));
+        const entries = [];
+        let nextUrl = null;
+        for (const a of links) {
+          try {
+            const u = new URL(a.href, location.href);
+            const m = u.pathname.match(/^\/jp\/auction\/([a-zA-Z]?\d+)$/);
+            if (m) {
+              entries.push({
+                id: m[1],
+                title: String(a.innerText || "").replace(/\s+/g, " ").trim(),
+              });
+            }
+          } catch (e) {
+            /* 解析できないリンクは無視する */
+          }
+        }
+        for (const a of links) {
+          const label = (a.innerText || a.getAttribute("aria-label") || "")
+            .replace(/\s+/g, " ")
+            .trim();
+          try {
+            const u = new URL(a.href, location.href);
+            if (
+              u.pathname === "/my/selling" &&
+              u.href !== location.href &&
+              /^(次へ|次のページ|›|»)/.test(label)
+            ) {
+              nextUrl = u.href;
+              break;
+            }
+          } catch (e) {
+            /* 解析できないリンクは無視する */
+          }
+        }
+        return { entries, nextUrl };
+      },
+    });
+    const r = results[0] && results[0].result;
+    return r || null;
+  };
+
+  // フェーズ1: 1 ページ目を最大 3 回（初回 + 再読み込み 2 回）探す。
+  await chrome.tabs.update(tabId, {
+    url: YAHOO_SELLING_SORTED_URL,
+    active: true,
+  });
+  if (!(await waitForTabComplete(tabId, 45000))) return null;
+  await remoteSleep(1200);
+  let nextUrl = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) {
+      await remoteSleep(5000);
+      try {
+        await chrome.tabs.reload(tabId);
+      } catch (e) {
+        /* 再読み込みに失敗したらそのまま読み直す */
+      }
+      if (!(await waitForTabComplete(tabId, 45000))) return null;
+      await remoteSleep(800);
+    }
+    const r = await extractPage();
+    if (!r) return null;
+    merge(r.entries);
+    nextUrl = r.nextUrl;
+    if (byId.has(oldId)) return oldId;
+  }
+  // フェーズ2: 2 ページ目以降を最大 10 ページ目までめくる。
+  for (let page = 1; page < 10 && nextUrl; page++) {
+    await chrome.tabs.update(tabId, { url: nextUrl, active: true });
+    if (!(await waitForTabComplete(tabId, 45000))) break;
+    await remoteSleep(800);
+    const r = await extractPage();
+    if (!r) break;
+    merge(r.entries);
+    nextUrl = r.nextUrl;
+    if (byId.has(oldId)) return oldId;
+  }
+  if (title) {
+    const matches = Array.from(byId.values()).filter(
+      (e) => e.id !== oldId && titlesMatch(e.title, title)
+    );
+    if (matches.length === 1) return matches[0].id;
   }
   return null;
 }
