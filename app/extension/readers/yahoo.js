@@ -196,14 +196,30 @@
           if (m) winPrice = parseInt(m[1], 10);
         }
         if (!shipMethod && t.includes('"methods"')) {
-          const m = t.match(/"shipping":\{"methods":\[\{"id":"[^"]*","name":"((?:[^"\\]|\\.)*)"/);
-          if (m) {
-            try { shipMethod = JSON.parse('"' + m[1] + '"'); } catch (e) { shipMethod = null; }
-            // 状態 JSON の名称は「おてがる配送ゆうパケット」のように
-            // 接頭辞付きで返る（2026-11-23 実測）。フォームのカード名は
-            // 接頭辞なし（ゆうパケット）なので、既知名称の最長一致で
-            // 正規化しておかないと自動選択が永遠に一致しない。
-            if (shipMethod) shipMethod = matchShipMethod(shipMethod) || shipMethod;
+          // shipping.methods は「出品者が選んだ方法」ではなく候補一覧の
+          // ことがある（2026-11-26 実測: 実際はゆうパックのみ提供の商品で
+          // 先頭がゆうパケットだった）。要素が 1 つだけのときだけ採用し、
+          // 複数あるときは DOM 側（配送方法の詳細と一致する表示）を優先
+          // させるため null のままにする。
+          const start = t.indexOf('"shipping":{"methods":[');
+          if (start >= 0) {
+            const block = t.slice(start, start + 4000);
+            const end = block.indexOf("]}");
+            const arrText = end >= 0 ? block.slice(0, end) : block;
+            const names = [];
+            const re = /\{"id":"[^"]*","name":"((?:[^"\\]|\\.)*)"/g;
+            let mm;
+            while ((mm = re.exec(arrText)) !== null && names.length <= 2) {
+              try { names.push(JSON.parse('"' + mm[1] + '"')); } catch (e) { /* 壊れた要素は数えない */ }
+            }
+            if (names.length === 1) {
+              shipMethod = names[0];
+              // 状態 JSON の名称は「おてがる配送ゆうパケット」のように
+              // 接頭辞付きで返る（2026-11-23 実測）。フォームのカード名は
+              // 接頭辞なし（ゆうパケット）なので、既知名称の最長一致で
+              // 正規化しておかないと自動選択が永遠に一致しない。
+              if (shipMethod) shipMethod = matchShipMethod(shipMethod) || shipMethod;
+            }
           }
         }
         if (descHtml && shipMethod) break;
