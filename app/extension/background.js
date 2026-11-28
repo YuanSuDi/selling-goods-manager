@@ -2746,16 +2746,6 @@ function normalizeListingTitle(s) {
     .replace(/[…\.]+$/, "");
 }
 
-function titlesMatch(a, b) {
-  const x = normalizeListingTitle(a);
-  const y = normalizeListingTitle(b);
-  if (!x || !y) return false;
-  if (x === y) return true;
-  const shorter = x.length <= y.length ? x : y;
-  const longer = x.length <= y.length ? y : x;
-  return shorter.length >= 12 && longer.startsWith(shorter);
-}
-
 // 再出品で公開された現在の出品 ID を特定する（ユーザー指定の手順
 // 2026-11-26）: 一覧は残り時間の長い順で開き、出品したばかりの商品が
 // 来るはずの 1 ページ目を最大 3 回まで再読み込みして探す。それでも
@@ -2856,10 +2846,18 @@ async function resolveYahooRelistedId(tabId, oldId, title) {
     if (byId.has(oldId)) return oldId;
   }
   if (title) {
-    const matches = Array.from(byId.values()).filter(
-      (e) => e.id !== oldId && titlesMatch(e.title, title)
-    );
-    if (matches.length === 1) return matches[0].id;
+    const target = normalizeListingTitle(title);
+    if (target) {
+      // 再出品のタイトルは元の出品と同一になる（途中で編集されない）ため、
+      // 完全一致だけで特定する。前方一致のような曖昧マッチは、タイトルが
+      // 前方一致になる別出品（例:「AY342 …」と「AY342 …（電球色）
+      // 2個セット」）まで候補に数えてしまい、一意に決められず失敗する
+      // （2026-11-27 の事故）。ユーザー指定で曖昧マッチは使わない。
+      const exact = Array.from(byId.values()).filter(
+        (e) => e.id !== oldId && normalizeListingTitle(e.title) === target
+      );
+      if (exact.length === 1) return exact[0].id;
+    }
   }
   return null;
 }

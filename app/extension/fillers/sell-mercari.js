@@ -144,12 +144,20 @@
   // カテゴリ/状態の選択ページに留まっている場合、履歴を戻って出品フォームへ帰る。
   // 失敗時に別ページで後続の入力（状態・画像）が空振りするのを防ぐ。
   async function backToSellForm() {
+    const onSubPage = () =>
+      /\/(categories|conditions|shipping_methods)/.test(location.pathname);
     for (let i = 0; i < 4; i++) {
-      if (!/\/(categories|conditions|shipping_methods)/.test(location.pathname)) return true;
+      if (!onSubPage() && !findWizardBackButton()) return true;
+      // 割り込みページ（カタログウィザード）にいる場合は履歴を戻さず、
+      // 監視が「出品画面に戻る」を押してフォームへ戻すのを待つ。
+      if (findWizardBackButton()) {
+        await sleepMs(1200);
+        continue;
+      }
       history.back();
       await sleepMs(1200);
     }
-    return !/\/(categories|conditions|shipping_methods)/.test(location.pathname);
+    return !onSubPage() && !findWizardBackButton();
   }
 
   // 戻り値: 成功したらフォームに実際に表示されたカテゴリパス、失敗したら false。
@@ -322,7 +330,14 @@
     if (!valueText) return false;
     if (selectValueOk(labelTexts, valueText)) return true;
     const sel = FF.findSelect(null, labelTexts);
-    if (!sel) return false;
+    if (!sel) {
+      console.warn(
+        "[FurimaCopy] select not found:",
+        labelTexts.join("/"),
+        "path=" + location.pathname
+      );
+      return false;
+    }
     try {
       FF.trySelectByText(sel, [
         valueText,
@@ -651,10 +666,176 @@
       } catch (e) {
         console.warn("[FurimaCopy] shipping pick failed: " + label, e);
       }
+      console.log(
+        "[FurimaCopy] shipping step:",
+        label,
+        ok ? "ok" : "FAILED",
+        "path=" + location.pathname
+      );
       if (ok) parts.push(label + ": " + value);
       else missing.push(label);
     }
     return { parts, missing };
+  }
+
+  // ---- 商品の特徴（カテゴリ連動の動的属性、v0.12.80） ----------------------
+  // カテゴリによっては「商品の特徴」欄に必須の属性 select
+  // （name="dynamicAttributes.<uuid>[n]"）があり、未選択だと出品できない
+  // （例: イヤホン分類の機能不良）。コピー元が値を持っていれば原生
+  // select へそのまま反映し、持っていない項目はパネルに名前を出して
+  // 知らせる（値を勝手に作ることはしない）。
+  function attrLabelFor(sel) {
+    const label = sel.closest("label");
+    if (label) {
+      const span = label.querySelector("span");
+      const t = norm((span && span.textContent) || "").replace(
+        /(任意|必須)$/g,
+        ""
+      );
+      if (t && t.length <= 40) return t;
+    }
+    const row = sel.closest('[class*="merFormInput"]');
+    if (row) {
+      const span = row.querySelector("span");
+      const t = norm((span && span.textContent) || "").replace(
+        /(任意|必須)$/g,
+        ""
+      );
+      if (t && t.length <= 40) return t;
+    }
+    return "";
+  }
+
+  function attrLine(data, attrRes) {
+    const unset = [...attrRes.unsetNames, ...attrRes.failedNames];
+    return {
+      label: "商品の特徴",
+      status: !unset.length
+        ? "ok"
+        : data.managerTask && attrRes.failedNames.length
+          ? "fail"
+          : "manual",
+      note: !unset.length
+        ? attrRes.setNames.length +
+          "件設定（" +
+          attrRes.setNames.join(", ") +
+          "）"
+        : "未設定: " +
+          unset.join(", ") +
+          (attrRes.setNames.length
+            ? "（設定済み: " + attrRes.setNames.join(", ") + "）"
+            : ""),
+    };
+  }
+
+  function upsertAttrLine(lines, data, attrRes) {
+    const line = attrLine(data, attrRes);
+    const idx = lines.findIndex((l) => l.label === "商品の特徴");
+    if (idx >= 0) lines[idx] = line;
+    else lines.push(line);
+  }
+
+  async function fillMercariAttributes(data) {
+    const attrs = Array.isArray(data.mercariAttributes)
+      ? data.mercariAttributes
+      : [];
+    console.log(
+      "[FurimaCopy] attributes: copy source has",
+      attrs.length
+        ? attrs.map((a) => a.name + "=" + a.value).join(", ")
+        : "(none)"
+    );
+    const byName = new Map(attrs.map((a) => [norm(a.name), a.value]));
+    const findSelects = () =>
+      Array.from(document.querySelectorAll('select[name^="dynamicAttributes."]'));
+    let selects = findSelects();
+    // カテゴリ選択直後はセクションの描画が遅れることがあるため少し待つ。
+    for (let i = 0; i < 10 && !selects.length; i++) {
+      await sleepMs(400);
+      selects = findSelects();
+    }
+    if (!selects.length) {
+      console.log("[FurimaCopy] attributes: no dynamic selects on page");
+      return { total: 0, setNames: [], unsetNames: [], failedNames: [] };
+    }
+    const trySet = (sel, label, val) => {
+      try {
+        if (!FF.trySelectByText(sel, [val])) return false;
+      } catch (e) {
+        console.warn("[FurimaCopy] attribute select failed", label, e);
+        return false;
+      }
+      const now = sel.options[sel.selectedIndex];
+      return !!(now && now.value && norm(now.textContent) === norm(val));
+    };
+    for (const sel of selects) {
+      const label = attrLabelFor(sel);
+      const cur = sel.options[sel.selectedIndex];
+      if (cur && cur.value) continue;
+      const val = label ? byName.get(norm(label)) : null;
+      if (val) {
+        console.log(
+          "[FurimaCopy] attribute",
+          label,
+          trySet(sel, label, val) ? "set to " + val : "FAILED to set " + val
+        );
+      }
+    }
+    // ページ遷移や再描画で値が戻されることがある（設定直後の確認だけでは
+    // 見逃す）。少し置いて再確認し、戻っていたら一度だけ設定し直す。
+    // 結果は最終状態で数え直して返す。
+    await sleepMs(1500);
+    for (const sel of findSelects()) {
+      const label = attrLabelFor(sel);
+      const val = label ? byName.get(norm(label)) : null;
+      if (!val) continue;
+      const cur = sel.options[sel.selectedIndex];
+      if (cur && cur.value && norm(cur.textContent) === norm(val)) continue;
+      console.log(
+        "[FurimaCopy] attribute",
+        label,
+        "was reverted; re-setting to",
+        val
+      );
+      trySet(sel, label, val);
+    }
+    await sleepMs(300);
+    const res = { total: 0, setNames: [], unsetNames: [], failedNames: [] };
+    for (const sel of findSelects()) {
+      const label = attrLabelFor(sel) || "(名称不明)";
+      res.total++;
+      const cur = sel.options[sel.selectedIndex];
+      if (cur && cur.value) {
+        res.setNames.push(label);
+      } else if (byName.has(norm(label))) {
+        res.failedNames.push(label);
+      } else {
+        res.unsetNames.push(label);
+      }
+    }
+    console.log("[FurimaCopy] attributes done:", JSON.stringify(res));
+    return res;
+  }
+
+  // フォーム上に表示されている必須エラー（「〜を選択してください」等）を
+  // 項目名のリストで返す。送信後に Mercari が弾いた理由を具体的に
+  // 報告するために使う。最も深い要素（＝エラー文そのもの）だけを見る。
+  function findFormErrorLabels() {
+    const labels = [];
+    const re = /^(.{1,24}?)(を選択してください|を入力してください)/;
+    const all = Array.from(document.querySelectorAll("body *"));
+    for (const el of all) {
+      const t = (el.textContent || "").trim();
+      if (!re.test(t)) continue;
+      const childHit = Array.from(el.children).some((c) =>
+        re.test((c.textContent || "").trim())
+      );
+      if (childHit) continue;
+      if (!FF.isVisible(el)) continue;
+      const m = t.match(re);
+      if (m && !labels.includes(m[1])) labels.push(m[1]);
+    }
+    return labels;
   }
 
   async function handleFill() {
@@ -664,6 +845,14 @@
       return null;
     }
     console.log("[FurimaCopy] mercari fill with:", data);
+    // 入力中も割り込みページの監視を効かせる（管理タスク経由で既に
+    // 動いている共有の監視があればそれを使う。自分で始めた監視は
+    // この入力の終わりに止める）。
+    let ownWatcher = null;
+    if (!sharedWatcher) {
+      sharedWatcher = startInterstitialWatcher("[FurimaCopy]");
+      ownWatcher = sharedWatcher;
+    }
     const lines = [];
 
     // タイトル
@@ -831,7 +1020,29 @@
       samePlatform &&
       (data.shippingPayer || data.shippingMethodName || data.shipFrom || data.shipDays)
     ) {
-      const ship = await fillMercariShipping(data);
+      let ship = await fillMercariShipping(data);
+      // 割り込みページ（カタログウィザード）に配送入力が空振りした場合は、
+      // 監視がフォームへ戻すのを待って配送だけを 1 回再試行する。
+      if (
+        ship.missing.length &&
+        sharedWatcher &&
+        (sharedWatcher.escapes > 0 || findWizardBackButton())
+      ) {
+        console.log(
+          "[FurimaCopy] shipping interrupted by interstitial; waiting for the form and retrying shipping once"
+        );
+        const formBack = await FF.waitFor(
+          () =>
+            !findWizardBackButton() &&
+            !!document.querySelector('input[name="name"]'),
+          15000,
+          400
+        );
+        if (formBack) {
+          const ship2 = await fillMercariShipping(data);
+          if (ship2.missing.length < ship.missing.length) ship = ship2;
+        }
+      }
       if (!ship.missing.length) {
         lines.push({
           label: "配送・送料",
@@ -860,6 +1071,24 @@
         status: "manual",
         note: "手動" + (data.shippingText ? "（候補： " + data.shippingText + "）" : "で選択してください"),
       });
+    }
+
+    // 商品の特徴（動的属性）は最後に設定する。配送の画面遷移などで
+    // フォームが再描画されると値が戻されるため、遷移が全部終わってから
+    // 設定し、完了後の割り込み復帰時にもフックで再適用する。
+    // 補助ステップの失敗で入力全体を巻き込まないよう、ここで隔離する。
+    if (samePlatform) {
+      try {
+        const attrRes = await fillMercariAttributes(data);
+        if (attrRes.total) lines.push(attrLine(data, attrRes));
+      } catch (e) {
+        console.warn("[FurimaCopy] attribute step failed", e);
+        lines.push({
+          label: "商品の特徴",
+          status: "manual",
+          note: "属性の自動入力でエラー: " + ((e && e.message) || e),
+        });
+      }
     }
 
     lines.push({
@@ -891,6 +1120,53 @@
         },
       });
     }
+    if (ownWatcher) {
+      // 入力完了の直後に割り込みページが来ることがある（入力中は一度も
+      // 出なかったのに、完了後に /sell/wizard へ飛ばされるケース）。
+      // 監視は即座に止めず 180 秒だけ残し、その間の割り込みも戻す。
+      // ただしユーザーが自分で「製品情報を入力する」を押したら、
+      // それは本人の意思なので監視を即座にやめる。
+      const w = ownWatcher;
+      ownWatcher = null;
+      const cleanup = () => {
+        try {
+          w.stop();
+        } catch (e) {
+          /* noop */
+        }
+        document.removeEventListener("click", standDown, true);
+        if (sharedWatcher === w) sharedWatcher = null;
+      };
+      const standDown = (ev) => {
+        if (
+          ev.target &&
+          ev.target.closest &&
+          ev.target.closest('[data-testid="move-to-next-screen-button"]')
+        ) {
+          cleanup();
+        }
+      };
+      document.addEventListener("click", standDown, true);
+      // 割り込みから復帰すると商品の特徴が初期化されることがあるため、
+      // 復帰のたびに属性だけを再適用してパネルも更新する。
+      w.setEscapeHook(async () => {
+        if (!document.querySelector('input[name="name"]')) return;
+        try {
+          const r = await fillMercariAttributes(data);
+          if (r.total) {
+            upsertAttrLine(lines, data, r);
+            FF.showPanel(
+              "メルカリ 出品フォーム入力結果",
+              lines,
+              data.managerTask ? { taskId: data.managerTask.id } : undefined
+            );
+          }
+        } catch (e) {
+          console.warn("[FurimaCopy] attribute re-apply failed", e);
+        }
+      });
+      setTimeout(cleanup, 180000);
+    }
     return lines;
   }
 
@@ -914,7 +1190,15 @@
           return false;
         }
         managerFillInProgress = true;
+        let watcherHandedOff = false;
         (async () => {
+          // 割り込みページの監視は入力開始前から動かす（フォーム準備待ちの
+          // 段階でウィザードに塞がれている場合も戻せるようにするため）。
+          if (!sharedWatcher) {
+            sharedWatcher = startInterstitialWatcher(
+              "[FurimaCopy][auto-submit]"
+            );
+          }
           const req = msg.request || {};
           if (!req.managerTaskId) {
             throw new Error("管理タスクの自動出品情報が不正です");
@@ -951,9 +1235,32 @@
           }
           const lines = await handleFill();
           if (!lines) throw new Error("コピー済みの商品がありません");
+          // 割り込みページに邪魔されて失敗した項目がある場合は、監視が
+          // フォームへ戻すのを待ってから入力を 1 回だけやり直す
+          // （各ステップは「既に合っていれば触らない」冪等な作り）。
+          if (
+            sharedWatcher &&
+            (sharedWatcher.escapes > 0 || findWizardBackButton()) &&
+            lines.some((l) => l.status === "fail")
+          ) {
+            console.log(
+              "[FurimaCopy][auto-submit] fill was interrupted; waiting for the form and refilling once"
+            );
+            const formBack = await FF.waitFor(
+              () =>
+                !findWizardBackButton() &&
+                !!document.querySelector('input[name="name"]'),
+              15000,
+              400
+            );
+            if (formBack) {
+              await handleFill();
+            }
+          }
           window.dispatchEvent(
             new CustomEvent("furimacopy-autofill-done", { detail: req })
           );
+          watcherHandedOff = true;
           return { ok: true };
         })()
           .then(sendResponse)
@@ -962,6 +1269,16 @@
           )
           .finally(() => {
             managerFillInProgress = false;
+            // 自動出品側へ引き継げなかった監視はここで止める
+            // （引き継げた場合は submitMercariListing の report() が止める）。
+            if (!watcherHandedOff && sharedWatcher) {
+              try {
+                sharedWatcher.stop();
+              } catch (e) {
+                /* noop */
+              }
+              sharedWatcher = null;
+            }
           });
         return true;
       }
@@ -1026,6 +1343,144 @@
     return cands[0];
   }
 
+  // ---- 割り込みページ監視（v0.12.76〜、入力フェーズにも拡張 v0.12.77） -------------------------------------
+  // 自動出品の最中、Mercari が「出品する商品の選択」（カタログ提案
+  // ウィザード）のような割り込みページを挟むことがある。割り込みを検出
+  // したら「出品画面に戻る」でフォームへ戻す。製品情報の入力側へは
+  // 絶対に進まない。将来別の割り込みページが増えたら INTERSTITIALS に
+  // ハンドラを足すだけで対応できる。
+  function findWizardBackButton() {
+    const wrap = document.querySelector(
+      '[data-testid="back-to-listing-button"]'
+    );
+    if (wrap && FF.isVisible(wrap)) {
+      return wrap.querySelector("button") || wrap;
+    }
+    // testid が変わった場合の予備: 2つのボタンのペアで判定する
+    const norm = (s) => (s || "").replace(/\s+/g, "");
+    const btns = Array.from(document.querySelectorAll("button")).filter(
+      FF.isVisible
+    );
+    const back = btns.find((b) => norm(b.textContent) === "出品画面に戻る");
+    const fwd = btns.find((b) => norm(b.textContent) === "製品情報を入力する");
+    return back && fwd ? back : null;
+  }
+
+  const INTERSTITIALS = [
+    {
+      name: "catalog-wizard",
+      findEscape: findWizardBackButton,
+    },
+  ];
+
+  // 管理タスクの自動入力開始から自動出品の報告まで、1つの監視を共有する。
+  let sharedWatcher = null;
+
+  // submitMercariListing の実行中だけ動く監視。終了は report() が止める。
+  function startInterstitialWatcher(LOG) {
+    const MAX_ESCAPES = 5;
+    let escapes = 0;
+    let escaping = false;
+    let stopped = false;
+    let scheduled = false;
+    let escapeHook = null;
+
+    async function tryEscape() {
+      if (stopped || escaping || escapes >= MAX_ESCAPES) return;
+      for (const h of INTERSTITIALS) {
+        let target = null;
+        try {
+          target = h.findEscape();
+        } catch (e) {
+          /* noop */
+        }
+        if (!target) continue;
+        escaping = true;
+        escapes++;
+        console.log(
+          LOG,
+          "interstitial detected (" +
+            h.name +
+            "), escaping " +
+            escapes +
+            "/" +
+            MAX_ESCAPES
+        );
+        try {
+          target.scrollIntoView({ block: "center" });
+          FF.clickLikeUser(target);
+          await sleepMs(1200);
+          const still = h.findEscape();
+          if (still) {
+            const inner =
+              (still.querySelector && still.querySelector("button")) || still;
+            try {
+              inner.click();
+            } catch (e) {
+              /* noop */
+            }
+            await sleepMs(800);
+          }
+        } catch (e) {
+          console.warn(LOG, "interstitial escape failed", e);
+        }
+        // 復帰後にフォーム側の一部状態が初期化されることがあるため、
+        // フックが登録されていれば呼ぶ（例: 商品の特徴の再適用）。
+        if (escapeHook && !h.findEscape()) {
+          try {
+            await escapeHook();
+          } catch (e) {
+            console.warn(LOG, "interstitial escape hook failed", e);
+          }
+        }
+        escaping = false;
+        return;
+      }
+    }
+
+    function schedule() {
+      if (scheduled || stopped) return;
+      scheduled = true;
+      setTimeout(() => {
+        scheduled = false;
+        tryEscape();
+      }, 150);
+    }
+
+    const observer = new MutationObserver(schedule);
+    try {
+      observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+      });
+    } catch (e) {
+      /* noop */
+    }
+    const timer = setInterval(schedule, 800);
+    schedule();
+
+    return {
+      get escapes() {
+        return escapes;
+      },
+      get capped() {
+        return escapes >= MAX_ESCAPES;
+      },
+      setEscapeHook(fn) {
+        escapeHook = fn || null;
+      },
+      stop() {
+        stopped = true;
+        try {
+          observer.disconnect();
+        } catch (e) {
+          /* noop */
+        }
+        clearInterval(timer);
+      },
+    };
+  }
+
   function findCompletionListingUrl() {
     const links = Array.from(
       document.querySelectorAll('a[href], [role="link"][href], button[href]')
@@ -1057,7 +1512,18 @@
 
   async function submitMercariListing(req) {
     const LOG = "[FurimaCopy][auto-submit]";
+    // 入力フェーズから動いている共有の監視があれば引き継ぐ。
+    let wizardWatcher = sharedWatcher;
     const report = async (patch) => {
+      if (wizardWatcher) {
+        try {
+          wizardWatcher.stop();
+        } catch (e) {
+          /* noop */
+        }
+        wizardWatcher = null;
+        sharedWatcher = null;
+      }
       try {
         await chrome.storage.local.set({
           lastSubmitReport: Object.assign(
@@ -1126,6 +1592,13 @@
       await report({ ok: true, stage: "done", listingUrl });
     };
     console.log(LOG, "start task=" + req.managerTaskId);
+    // 割り込みページ（カタログウィザード等）の監視。入力フェーズから
+    // 動いている共有の監視があればそれを使い、無ければここで開始する。
+    // 終了は report() が担当する（全ての終了経路が report を通る）。
+    if (!wizardWatcher) {
+      wizardWatcher = startInterstitialWatcher(LOG);
+      sharedWatcher = wizardWatcher;
+    }
     // 入力結果に致命的な失敗（⚠️）やカテゴリ未選択があれば送信しない。
     try {
       const st = await chrome.storage.local.get("lastFillReport");
@@ -1185,13 +1658,24 @@
       console.warn(LOG, "guard check error", e);
     }
     console.log(LOG, "guard passed, looking for submit button");
-    const btn = await FF.waitFor(findSubmitButton, 15000, 300);
+    // 監視が割り込みページから戻してくれる時間を確保するため、
+    // ボタン探索は最大 30 秒まで粘る。
+    let btn = null;
+    const searchDeadline = Date.now() + 30000;
+    while (Date.now() < searchDeadline) {
+      btn = findSubmitButton();
+      if (btn) break;
+      await sleepMs(300);
+    }
     if (!btn) {
       console.warn(LOG, "submit button not found");
       await report({
         ok: false,
         stage: "submit",
-        message: "出品するボタンが見つかりませんでした",
+        message:
+          wizardWatcher && wizardWatcher.capped && findWizardBackButton()
+            ? "製品情報の入力画面から出品画面に戻れませんでした"
+            : "出品するボタンが見つかりませんでした",
       });
       return;
     }
@@ -1212,6 +1696,7 @@
     const startedAt = Date.now();
     let retried = false;
     let modalClicked = false;
+    let escapesSeen = 0;
     for (;;) {
       await sleepMs(1500);
       const m = location.href.match(/jp\.mercari\.com\/item\/(m[A-Za-z0-9]+)/);
@@ -1236,6 +1721,41 @@
           FF.clickLikeUser(other);
           continue;
         }
+      }
+      // Mercari が必須未入力で弾いた場合は、項目名を挙げて即座に失敗とする
+      // （汎用のタイムアウトより原因が分かる）。
+      const errLabels = findFormErrorLabels();
+      if (errLabels.length) {
+        await report({
+          ok: false,
+          stage: "submit",
+          message: "未入力の必須項目があります: " + errLabels.join(", "),
+        });
+        return;
+      }
+      // 送信クリック後に割り込みページへ飛ばされ、監視がフォームへ
+      // 戻していた場合は、まだ出品できていないので「出品する」を押し直す。
+      if (wizardWatcher && wizardWatcher.escapes > escapesSeen) {
+        escapesSeen = wizardWatcher.escapes;
+        const again = findSubmitButton();
+        if (again) {
+          console.log(
+            LOG,
+            "back on the form after interstitial, clicking submit again"
+          );
+          btn = again;
+          retried = false;
+          FF.clickLikeUser(again);
+          continue;
+        }
+      }
+      if (wizardWatcher && wizardWatcher.capped && findWizardBackButton()) {
+        await report({
+          ok: false,
+          stage: "submit",
+          message: "製品情報の入力画面から出品画面に戻れませんでした",
+        });
+        return;
       }
       if (!retried && Date.now() - startedAt > 6000) {
         retried = true;

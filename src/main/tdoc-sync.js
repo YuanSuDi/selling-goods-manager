@@ -312,11 +312,16 @@ async function runSync(ctx, state, trigger) {
     const client = new TdocClient(s.token)
     const tablesRes = await client.callTool('smartsheet.list_tables', { file_id: s.fileId })
     const allSheets = tablesRes.sheets || []
+    // 単一子表モードで保存済み sheet_id が現在の文档に無い場合は、別文档の
+    // 子表を持ち越した同名取り違えなので、推測で進めず明確なエラーで止める。
+    if (s.sheetMode === 'single' && !allSheets.some((sh) => sh.sheet_id === s.sheetId)) {
+      throw new Error(
+        '保存的子表不属于当前文档（文档 ID 变更后需重新读取子表）。请在同步页点「读取子表」重新选择子表并保存设置'
+      )
+    }
     const candidates =
       s.sheetMode === 'single'
-        ? allSheets.filter((sh) => sh.sheet_id === s.sheetId).length
-          ? allSheets.filter((sh) => sh.sheet_id === s.sheetId)
-          : [{ sheet_id: s.sheetId, title: s.sheetId }]
+        ? allSheets.filter((sh) => sh.sheet_id === s.sheetId)
         : allSheets
 
     const mgr = await buildManagerView(ctx)

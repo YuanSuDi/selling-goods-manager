@@ -30,11 +30,14 @@ const autoEnabledInput = ref(false)
 const intervalInput = ref(30)
 const formLoaded = ref(false)
 
+const sheetsFileId = ref('')
+
 watch(
   settings,
   (s) => {
     if (!s || formLoaded.value) return
     fileIdInput.value = s.fileId || ''
+    sheetsFileId.value = s.fileId || ''
     sheetModeInput.value = s.sheetMode || 'all'
     sheetIdInput.value = s.sheetId || ''
     idFieldInput.value = s.idField || '编号'
@@ -71,8 +74,18 @@ const saveSettings = () => {
 }
 
 const loadSheets = () => {
+  sheetsFileId.value = fileIdInput.value
   tdocListSheets({ token: tokenInput.value, fileId: fileIdInput.value })
 }
+
+// 文档 ID が変わったら、別文档の子表選択を持ち越さない（同名子表の取り違え防止）。
+// 子表は今の文档 ID で「读取子表」し直してから選び直す。
+watch(fileIdInput, (v) => {
+  if (!formLoaded.value) return
+  if (v !== sheetsFileId.value && sheetIdInput.value) {
+    sheetIdInput.value = ''
+  }
+})
 
 const fmtTime = (iso) => {
   if (!iso) return ''

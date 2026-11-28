@@ -117,6 +117,38 @@
     return String(text).trim() || null;
   }
 
+  // 商品の特徴（カテゴリ連動の動的属性）を item オブジェクトから拾う。
+  // 属性は {name, value} 形式のペアで保持されている想定で、構造が未知の
+  // キー配下にあっても再帰的に探す。名前がフォーム側のラベルと一致する
+  // ペアだけが入力側で使われるため、無関係なペアが混ざっても害はない。
+  function extractAttributes(item) {
+    const out = [];
+    const seen = new Set();
+    const walk = (node, depth) => {
+      if (!node || typeof node !== "object" || depth > 6) return;
+      if (Array.isArray(node)) {
+        node.forEach((x) => walk(x, depth + 1));
+        return;
+      }
+      const name = node.name || node.displayName || node.label;
+      const value = node.value || node.displayValue || node.selectedValue;
+      if (typeof name === "string" && typeof value === "string") {
+        const n = name.trim();
+        const v = value.trim();
+        if (n && v && !seen.has(n)) {
+          seen.add(n);
+          out.push({ name: n, value: v });
+        }
+      }
+      for (const k of Object.keys(node)) {
+        if (/photo|image|thumbnail/i.test(k)) continue;
+        walk(node[k], depth + 1);
+      }
+    };
+    walk(item, 0);
+    return out;
+  }
+
   function extractFromNextData() {
     const el = document.getElementById("__NEXT_DATA__");
     if (!el || !el.textContent) return null;
@@ -143,6 +175,7 @@
       shippingText: shipping,
       shippingPayer: payer || null,
       shippingMethodName: method ? normalizeMercariMethod(method) : null,
+      mercariAttributes: extractAttributes(item),
     };
   }
 
@@ -261,6 +294,41 @@
     return null;
   }
 
+  // 商品ページの「商品の特徴」セクション（data-testid="item-feature-section"）
+  // に表示される属性チップ「名前： 値」を読む。出品時に設定された属性だけが
+  // ここに並ぶので、これが最も確実な出所（全商品にあるわけではない）。
+  function extractFeatureAttributes() {
+    const section = document.querySelector(
+      '[data-testid="item-feature-section"]'
+    );
+    if (!section) return [];
+    const out = [];
+    const seen = new Set();
+    const re = /^(.{1,30}?)[：:]\s*(.+)$/;
+    for (const el of Array.from(section.querySelectorAll("*"))) {
+      const t = (el.textContent || "").trim();
+      const m = t.match(re);
+      if (!m) continue;
+      // 子要素にも一致するものがあれば最深の要素だけを採用する。
+      const childHit = Array.from(el.children).some((c) =>
+        re.test((c.textContent || "").trim())
+      );
+      if (childHit) continue;
+      const name = m[1].trim();
+      const value = m[2].trim();
+      if (!name || !value || seen.has(name)) continue;
+      seen.add(name);
+      out.push({ name, value });
+    }
+    if (out.length) {
+      console.log(
+        "[FurimaCopy] feature attributes:",
+        out.map((a) => a.name + "=" + a.value).join(", ")
+      );
+    }
+    return out;
+  }
+
   function extractFromDom() {
     const imgs = [];
     document
@@ -293,6 +361,7 @@
         FC.dom.specValue(["発送元の地域"]) || specByLabelAny(["発送元の地域"]),
       shipDays:
         FC.dom.specValue(["発送までの日数"]) || specByLabelAny(["発送までの日数"]),
+      mercariAttributes: extractFeatureAttributes(),
     };
   }
 
@@ -358,7 +427,12 @@
       console.warn("[FurimaCopy] NEXT_DATA の解析に失敗", e);
     }
     // JSON で取れた項目を優先し、欠けた項目だけ DOM で補う。
-    const data = FC.mergeData(extractFromDom(), jsonData);
+    const domData = extractFromDom();
+    const data = FC.mergeData(domData, jsonData);
+    // 商品の特徴だけは商品ページの表示（DOM）が正。JSON 側の推測抽出より優先する。
+    if (domData.mercariAttributes && domData.mercariAttributes.length) {
+      data.mercariAttributes = domData.mercariAttributes;
+    }
     data.imageUrls = filterItemPhotos(data.imageUrls);
     let saved = await FC.save(
       Object.assign({}, data, { source: "mercari", sourceUrl: location.href })
