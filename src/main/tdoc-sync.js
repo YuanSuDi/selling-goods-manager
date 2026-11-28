@@ -212,6 +212,13 @@ async function fetchAllRecords(client, fileId, sheetId) {
   return all
 }
 
+// update_records / add_records の field_values は、フィールド名をキーにした
+// オブジェクトで渡すと API が成功を返しても値が反映されない（実績あり）。
+// 必ず { field: 名前, ...値 } の配列で渡すこと。
+function fvEntry(field, value) {
+  return Object.assign({ field }, value)
+}
+
 // ---- 三者照合（純粋関数・テスト対象） ----
 // sheet/manager: Map<id, {name, recordId?, stocks:{cond:qty}}>
 // snapshot: {id: {cond: qty}}（1 子表分）
@@ -378,8 +385,8 @@ async function runSync(ctx, state, trigger) {
       }
       const byRecord = new Map()
       for (const item of plan.toSheet) {
-        if (!byRecord.has(item.recordId)) byRecord.set(item.recordId, {})
-        byRecord.get(item.recordId)[item.cond] = { number_value: item.qty }
+        if (!byRecord.has(item.recordId)) byRecord.set(item.recordId, [])
+        byRecord.get(item.recordId).push(fvEntry(item.cond, { number_value: item.qty }))
       }
       const recordUpdates = [...byRecord.entries()].map(([record_id, field_values]) => ({ record_id, field_values }))
       for (let i = 0; i < recordUpdates.length; i += 50) {
@@ -544,18 +551,17 @@ async function pushProduct(ctx, state, sheetId, id) {
   const entry = mgr.byId.get(id)
   if (!entry) throw new Error('商品が見つかりません')
   const client = new TdocClient(s.token)
-  const wrapped = {}
-  wrapped[s.idField] = { text_value: { items: [{ text: id, type: 'text' }] } }
+  const field_values = [fvEntry(s.idField, { text_value: { items: [{ text: id, type: 'text' }] } })]
   if (s.nameField) {
-    wrapped[s.nameField] = { text_value: { items: [{ text: entry.name || '', type: 'text' }] } }
+    field_values.push(fvEntry(s.nameField, { text_value: { items: [{ text: entry.name || '', type: 'text' }] } }))
   }
   for (const [condName, qty] of Object.entries(entry.stocks)) {
-    wrapped[condName] = { number_value: qty }
+    field_values.push(fvEntry(condName, { number_value: qty }))
   }
   await client.callTool('smartsheet.add_records', {
     file_id: s.fileId,
     sheet_id: targetSheet,
-    records: [{ field_values: wrapped }],
+    records: [{ field_values }],
   })
   if (!state.snapshot) state.snapshot = {}
   if (!state.snapshot[targetSheet]) state.snapshot[targetSheet] = {}
@@ -598,8 +604,7 @@ async function resolveConflict(ctx, state, sheetId, id, cond, useSheet) {
     const parsed = parseSheetRecords(records, s.idField, s.nameField, det.stockTitles)
     const target = parsed.byId.get(id)
     if (!target) throw new Error('文档側に対象レコードが見つかりません')
-    const field_values = {}
-    field_values[cond] = { number_value: c.mgrQty }
+    const field_values = [fvEntry(cond, { number_value: c.mgrQty })]
     await client.callTool('smartsheet.update_records', {
       file_id: s.fileId,
       sheet_id: targetSheet,
@@ -714,4 +719,4 @@ function registerTdocIpc(ctx) {
   }, 60000)
 }
 
-module.exports = { registerTdocIpc, computeSyncPlan, parseSheetRecords, detectInventorySheet }
+module.exports = { registerTdocIpc, computeSyncPlan, parseSheetRecords, detectInventorySheet, fvEntry }
